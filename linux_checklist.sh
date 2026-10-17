@@ -3,7 +3,8 @@
 # linux_checklist.sh
 #
 # Debian / Linux Mint audit + hardening helper, based on the
-# "Ultimate Linux Checklist" (CyberPatriot-style) document.
+# "Ultimate Linux Checklist" (CyberPatriot-style) document,
+# plus an Ubuntu-specific checklist (section 24).
 #
 # USAGE:
 #   sudo ./linux_checklist.sh                 # audit only (safe, read-only)
@@ -321,13 +322,42 @@ if [ "$HARDEN" -eq 1 ]; then
     ok "Updated /etc/pam.d/common-password (backup saved)"
   fi
 
-  if confirm "Add account lockout after 5 failed attempts (pam_tally2, 30 min unlock) to /etc/pam.d/common-auth?"; then
-    backup_file /etc/pam.d/common-auth
-    if ! grep -q 'pam_tally2.so' /etc/pam.d/common-auth; then
-      echo "auth required pam_tally2.so deny=5 onerr=fail unlock_time=1800" >> /etc/pam.d/common-auth
-      ok "Appended pam_tally2 lockout rule to /etc/pam.d/common-auth"
+  if confirm "Add account lockout after 5 failed attempts (30 min unlock) to /etc/pam.d/common-auth?"; then
+    # pam_tally2 was removed in newer releases (Ubuntu 22.04+/Mint 21+); using a missing
+    # module in a 'required' line breaks ALL authentication (sudo, su, login).
+    # So: detect which module actually exists, and never touch the file otherwise.
+    find_pam_mod() { find /lib /lib64 /usr/lib -name "$1" 2>/dev/null | head -n 1; }
+    TALLY_MOD="$(find_pam_mod pam_tally2.so)"
+    FAIL_MOD="$(find_pam_mod pam_faillock.so)"
+
+    if [ -n "$TALLY_MOD" ]; then
+      backup_file /etc/pam.d/common-auth
+      if ! grep -q 'pam_tally2.so' /etc/pam.d/common-auth; then
+        # Insert BEFORE the first pam_unix.so line (not appended after pam_deny/pam_permit)
+        sed -i '0,/^auth.*pam_unix\.so.*$/s//auth    required                        pam_tally2.so deny=5 onerr=fail unlock_time=1800\n&/' /etc/pam.d/common-auth
+        ok "Added pam_tally2 lockout rule to /etc/pam.d/common-auth"
+      else
+        info "pam_tally2 already configured; skipping."
+      fi
+    elif [ -n "$FAIL_MOD" ]; then
+      backup_file /etc/pam.d/common-auth
+      backup_file /etc/pam.d/common-account
+      if ! grep -q 'pam_faillock.so' /etc/pam.d/common-auth; then
+        warn "KEEP A ROOT SHELL OPEN in another terminal (sudo -i) until you've tested a login!"
+        # preauth before pam_unix, authfail after it, authsucc after that; account check in common-account
+        sed -i '0,/^auth.*pam_unix\.so.*$/s//auth    required                        pam_faillock.so preauth\n&\nauth    [default=die]                   pam_faillock.so authfail\nauth    sufficient                      pam_faillock.so authsucc/' /etc/pam.d/common-auth
+        grep -q 'pam_faillock.so' /etc/pam.d/common-account || echo "account required pam_faillock.so" >> /etc/pam.d/common-account
+        if [ -f /etc/security/faillock.conf ]; then
+          backup_file /etc/security/faillock.conf
+          sed -i -E 's/^#?\s*deny\s*=.*/deny = 5/; s/^#?\s*unlock_time\s*=.*/unlock_time = 1800/' /etc/security/faillock.conf
+        fi
+        ok "Added pam_faillock lockout (deny=5, unlock 30 min). TEST sudo in a NEW terminal before closing your root shell."
+        info "If it breaks: cp -p /etc/pam.d/common-auth.bak-${TS} /etc/pam.d/common-auth"
+      else
+        info "pam_faillock already configured; skipping."
+      fi
     else
-      info "pam_tally2 already configured; skipping."
+      warn "Neither pam_tally2.so nor pam_faillock.so found — skipping lockout (would break authentication)."
     fi
   fi
 fi
@@ -785,6 +815,107 @@ else
     dpkg-reconfigure -plow unattended-upgrades 2>&1 | tee -a "$LOGFILE"
     ok "unattended-upgrades installed."
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# 24. Ubuntu Checklist
+# ---------------------------------------------------------------------------
+hdr "24. Ubuntu Checklist"
+
+if [ "${DISTRO_ID:-}" != "ubuntu" ] && ! echo "${ID_LIKE:-}" | grep -qi ubuntu; then
+  info "Not an Ubuntu system — skipping Ubuntu-specific checklist."
+else
+  # --- FIRST: update/upgrade (already handled in 1b; reminder only) ---
+  info "FIRST: sudo apt update && sudo apt upgrade   (if needed: sudo apt dist-upgrade)"
+  info "       Covered by section 1b above. (Note: the command is dist-upgrade, not dist-update.)"
+
+  # --- Forensics ---
+  info "Forensics: Solve BOTH forensics questions first, in case you delete or change something you need."
+
+  # --- Ubuntu Software Updates ---
+  hdr "24a. Ubuntu Software Updates"
+  info "GUI: System settings -> Software & Updates -> Updates tab:"
+  info "  - Check important security updates and recommended updates."
+  info "  - Automatically check for updates: Daily."
+  info "  - When there are security updates: Download and Install Automatically."
+  info "  - Also open 'Software Updater' from the application launcher and check for updates."
+
+  AUTO_CONF="/etc/apt/apt.conf.d/20auto-upgrades"
+  info "Current $AUTO_CONF:"
+  if [ -f "$AUTO_CONF" ]; then
+    tee -a "$LOGFILE" < "$AUTO_CONF"
+  else
+    warn "$AUTO_CONF not found."
+  fi
+
+  if [ "$HARDEN" -eq 1 ] && confirm "Set apt to check daily and auto download/install security updates ($AUTO_CONF)?"; then
+    apt-get install -y unattended-upgrades 2>&1 | tee -a "$LOGFILE"
+    backup_file "$AUTO_CONF"
+    cat > "$AUTO_CONF" <<'AUTOEOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+AUTOEOF
+    ok "Wrote $AUTO_CONF (daily check, download + install security updates)."
+  fi
+
+  # --- Program Updates ---
+  hdr "24b. Program Updates"
+  info "Make sure every application listed in the README is up to date."
+  info "  Use Ubuntu Software and/or the terminal: sudo apt install <application>"
+
+  # --- Firefox ---
+  hdr "24c. Firefox Settings (manual — cannot be safely automated)"
+  info "General: enable automatic updates; untick 'Recommend extensions as you browse' and"
+  info "         'Recommend features as you browse'."
+  info "Home: untick Sponsored shortcuts, Recommended by Pocket, and Snippets."
+  info "Search: untick search suggestions; set DuckDuckGo as the default search engine."
+  info "Privacy & Security:"
+  info "  - Enhanced Tracking Protection: Strict"
+  info "  - Delete cookies and site data when Firefox is closed"
+  info "  - Untick everything under Address Bar suggestions"
+  info "  - Block pop-up windows"
+  info "  - Warn when websites try to install add-ons"
+  info "  - Block dangerous and deceptive content / downloads"
+  info "  - Warn about unwanted and uncommon software"
+  info "  - HTTPS-Only Mode: enable in all windows"
+  info "  - DNS over HTTPS: Max Protection"
+
+  # --- Firewall ---
+  hdr "24d. Firewall Defaults (ufw)"
+  if ! command -v ufw >/dev/null 2>&1; then
+    warn "ufw not installed (see section 6)."
+  else
+    info "Checklist: sudo ufw enable; sudo ufw default reject incoming; sudo ufw default allow outgoing"
+    if [ "$HARDEN" -eq 1 ] && confirm "Set ufw defaults (reject incoming, allow outgoing) and enable ufw?"; then
+      ufw --force enable 2>&1 | tee -a "$LOGFILE"
+      ufw default reject incoming 2>&1 | tee -a "$LOGFILE"
+      ufw default allow outgoing 2>&1 | tee -a "$LOGFILE"
+      ufw status verbose | tee -a "$LOGFILE"
+    fi
+    info "Allow needed applications with: sudo ufw allow <application>"
+  fi
+
+  # --- Password policy ---
+  hdr "24e. Password Policy (reminder)"
+  info "Checklist: cd /etc/pam.d -> sudo apt install libpam-cracklib -> sudo nano common-password"
+  info "Section 5b already automates this. On newer Ubuntu releases libpam-cracklib may be"
+  info "replaced by libpam-pwquality (pam_pwquality.so) — check which line your common-password uses."
+
+  # --- MP3/MP4 files (system-wide) ---
+  hdr "24f. MP3/MP4 Files (system-wide)"
+  info "Locating .mp3 and .mp4 files (updating locate database first)..."
+  if command -v updatedb >/dev/null 2>&1; then
+    updatedb 2>/dev/null
+  fi
+  if command -v locate >/dev/null 2>&1; then
+    locate -i '*.mp3' '*.mp4' 2>/dev/null | tee -a "$LOGFILE"
+  else
+    find / -xdev -type f \( -iname '*.mp3' -o -iname '*.mp4' \) \
+      -not -path '/proc/*' -not -path '/sys/*' 2>/dev/null | tee -a "$LOGFILE"
+  fi
+  warn "Delete any unauthorized media files manually (rm -f <path>) — this script does not auto-delete."
 fi
 
 # ---------------------------------------------------------------------------
