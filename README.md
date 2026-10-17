@@ -1,0 +1,2 @@
+# shittyvibecodedscript
+shittyvibecodedcyberpatriotscript
