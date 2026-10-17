@@ -4,7 +4,8 @@
 #
 # Debian / Linux Mint audit + hardening helper, based on the
 # "Ultimate Linux Checklist" (CyberPatriot-style) document,
-# plus an Ubuntu-specific checklist (section 24).
+# plus an Ubuntu-specific checklist (section 24), FTP removal (25) and
+# Mint Update Manager / full-upgrade steps (26).
 #
 # USAGE:
 #   sudo ./linux_checklist.sh                 # audit only (safe, read-only)
@@ -916,6 +917,73 @@ AUTOEOF
       -not -path '/proc/*' -not -path '/sys/*' 2>/dev/null | tee -a "$LOGFILE"
   fi
   warn "Delete any unauthorized media files manually (rm -f <path>) — this script does not auto-delete."
+fi
+
+# ---------------------------------------------------------------------------
+# 25. FTP Service (disable or remove)
+# ---------------------------------------------------------------------------
+hdr "25. FTP Service"
+
+FTP_PKGS="vsftpd proftpd-basic proftpd pure-ftpd pure-ftpd-common"
+FTP_FOUND=""
+for pkg in $FTP_PKGS; do
+  if dpkg -l "$pkg" 2>/dev/null | grep -q '^ii'; then
+    FTP_FOUND="$FTP_FOUND $pkg"
+  fi
+done
+
+if [ -z "$FTP_FOUND" ]; then
+  ok "No common FTP server packages (vsftpd, proftpd, pure-ftpd) are installed."
+else
+  bad "FTP server package(s) installed:$FTP_FOUND"
+  for svc in vsftpd proftpd pure-ftpd; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      warn "$svc service is RUNNING."
+    fi
+  done
+  info "Checklist: sudo systemctl stop vsftpd && sudo apt purge vsftpd   (answer y at the prompt)"
+  if [ "$HARDEN" -eq 1 ] && confirm "Stop and purge FTP server package(s):$FTP_FOUND ?"; then
+    for pkg in $FTP_FOUND; do
+      svc="$pkg"
+      case "$pkg" in proftpd-basic) svc="proftpd" ;; pure-ftpd-common) svc="pure-ftpd" ;; esac
+      systemctl stop "$svc" 2>&1 | tee -a "$LOGFILE"
+      systemctl disable "$svc" 2>&1 | tee -a "$LOGFILE"
+    done
+    # shellcheck disable=SC2086
+    apt-get purge -y $FTP_FOUND 2>&1 | tee -a "$LOGFILE"
+    ok "FTP server package(s) purged."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 26. Update Manager (Linux Mint) / Install Security Updates
+# ---------------------------------------------------------------------------
+hdr "26. Automatic Updates & Install Security Updates"
+
+info "Refresh the update list automatically (Mint Update Manager):"
+info "  Menu -> Control Center -> Update Manager -> Edit -> Preferences -> Automation tab"
+info "  -> enable 'Apply updates automatically'. (Use your account password from the README if prompted.)"
+
+if command -v mintupdate-automation >/dev/null 2>&1; then
+  info "mintupdate-automation is available."
+  if [ "$HARDEN" -eq 1 ] && confirm "Enable Update Manager 'Apply updates automatically' (mintupdate-automation upgrade enable)?"; then
+    if mintupdate-automation upgrade enable 2>&1 | tee -a "$LOGFILE"; then
+      ok "Requested: Apply updates automatically. Verify in Update Manager -> Preferences -> Automation."
+    else
+      warn "mintupdate-automation failed — set it manually via the GUI steps above."
+    fi
+  fi
+else
+  info "mintupdate-automation not found (not Mint, or Update Manager not installed) — apt auto-updates are handled in sections 23/24."
+fi
+
+info "Install updates (important security updates):"
+info "  GUI: Update Manager -> Refresh -> Install Updates   (auto-apply must be set in Preferences first)"
+info "  CLI: sudo apt update && sudo apt full-upgrade -y"
+if [ "$HARDEN" -eq 1 ] && confirm "Run apt-get update && apt-get full-upgrade -y now?"; then
+  apt-get update 2>&1 | tee -a "$LOGFILE"
+  apt-get full-upgrade -y 2>&1 | tee -a "$LOGFILE"
+  ok "apt full-upgrade complete."
 fi
 
 # ---------------------------------------------------------------------------
