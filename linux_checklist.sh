@@ -643,17 +643,79 @@ for key in "${!SYSCTL_CHECKS[@]}"; do
 done
 
 if [ "$HARDEN" -eq 1 ]; then
-  if confirm "Write recommended values to /etc/sysctl.d/99-hardening.conf and apply now?"; then
-    HFILE=/etc/sysctl.d/99-hardening.conf
+  if confirm "Write recommended values to /etc/sysctl.d/99-zz-hardening.conf and apply now?"; then
+    # Named 99-zz-* so it sorts AFTER other files (e.g. 99-sysctl.conf -> /etc/sysctl.conf).
+    # With the old name (99-hardening.conf), a later file could silently override it,
+    # which made the same FLAG reappear on every run / after reboot.
+    HFILE=/etc/sysctl.d/99-zz-hardening.conf
+    OLDFILE=/etc/sysctl.d/99-hardening.conf
+    SYSCTL_DIRS="/etc/sysctl.conf /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d"
+
+    if [ -f "$OLDFILE" ]; then
+      backup_file "$OLDFILE"
+      rm -f "$OLDFILE"
+      info "Removed old $OLDFILE (superseded by $HFILE)."
+    fi
     backup_file "$HFILE"
     {
       echo "# Added by linux_checklist.sh on $TS"
       for key in "${!SYSCTL_CHECKS[@]}"; do
         echo "$key = ${SYSCTL_CHECKS[$key]}"
       done
+      echo "net.ipv4.conf.default.log_martians = 1"
     } > "$HFILE"
+
+    # Find OTHER files that set the same keys to a different value (these win/lose depending on order)
+    CONFLICTS=""
+    for key in "${!SYSCTL_CHECKS[@]}"; do
+      want="${SYSCTL_CHECKS[$key]}"
+      kre="${key//./[./]}"
+      while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        f="${line%%:*}"; rest="${line#*:}"; rest="${rest#*:}"
+        [ "$f" = "$HFILE" ] && continue
+        val="$(echo "$rest" | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]+$//')"
+        if [ "$val" != "$want" ]; then
+          CONFLICTS="$CONFLICTS$f|$key|$val"$'\n'
+        fi
+      done < <(grep -rnHE "^[[:space:]]*${kre}[[:space:]]*=" $SYSCTL_DIRS 2>/dev/null \
+               | grep -v "^$HFILE:")
+    done
+
+    if [ -n "$CONFLICTS" ]; then
+      warn "Other config files set these keys to different values:"
+      echo "$CONFLICTS" | while IFS='|' read -r f k v; do
+        [ -n "$f" ] && warn "  $f: $k = $v"
+      done | tee -a "$LOGFILE"
+      if confirm "Comment out those conflicting lines (backups are made first)?"; then
+        echo "$CONFLICTS" | cut -d'|' -f1 | sort -u | while read -r f; do
+          [ -z "$f" ] && continue
+          [ -L "$f" ] && f="$(readlink -f "$f")"
+          backup_file "$f"
+          for key in "${!SYSCTL_CHECKS[@]}"; do
+            kre="${key//./[./]}"
+            sed -i -E "s|^([[:space:]]*${kre}[[:space:]]*=.*)$|# disabled by linux_checklist.sh: \1|" "$f"
+          done
+        done
+        ok "Conflicting lines commented out."
+      fi
+    fi
+
+    # Apply the whole sysctl configuration in real load order, then verify the FINAL values
+    sysctl --system 2>&1 | tee -a "$LOGFILE" >/dev/null
     sysctl -p "$HFILE" 2>&1 | tee -a "$LOGFILE"
-    ok "Applied and persisted in $HFILE"
+    ok "Wrote and applied $HFILE"
+
+    info "Verifying final values after apply:"
+    for key in "${!SYSCTL_CHECKS[@]}"; do
+      cur="$(sysctl -n "$key" 2>/dev/null || echo "unknown")"
+      want="${SYSCTL_CHECKS[$key]}"
+      if [ "$cur" = "$want" ]; then
+        ok "$key = $cur"
+      else
+        bad "$key = $cur (wanted $want) — something is still overriding it. Check: grep -rn '${key##*.}' /etc/sysctl.conf /etc/sysctl.d /usr/lib/sysctl.d"
+      fi
+    done
   fi
 fi
 
@@ -991,18 +1053,49 @@ fi
 # ---------------------------------------------------------------------------
 hdr "Extra: USB Automount"
 
-if command -v gsettings >/dev/null 2>&1; then
-  info "Current automount settings (if a GUI session is active, run as the logged-in user):"
-  su - "$(logname 2>/dev/null || echo "$SUDO_USER")" -c "gsettings get org.gnome.desktop.media-handling automount" 2>/dev/null | tee -a "$LOGFILE"
-fi
+# gsettings must run inside the logged-in user's desktop session. Under sudo there is no
+# D-Bus session, which causes "dconf-WARNING: Cannot autolaunch D-Bus without X11 $DISPLAY"
+# and the change is silently NOT saved. So point it at the user's existing session bus.
+user_gsettings() {
+  local u="$1"; shift
+  local uid; uid="$(id -u "$u" 2>/dev/null)" || return 1
+  [ -S "/run/user/$uid/bus" ] || return 1
+  sudo -u "$u" env "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+    XDG_RUNTIME_DIR="/run/user/$uid" gsettings "$@"
+}
 
-if [ "$HARDEN" -eq 1 ] && command -v gsettings >/dev/null 2>&1; then
+if command -v gsettings >/dev/null 2>&1; then
   target_user="$(logname 2>/dev/null || echo "${SUDO_USER:-}")"
-  if [ -n "$target_user" ] && confirm "Disable automount/autorun for user '$target_user' via gsettings?"; then
-    su - "$target_user" -c "gsettings set org.gnome.desktop.media-handling automount false" 2>&1 | tee -a "$LOGFILE"
-    su - "$target_user" -c "gsettings set org.gnome.desktop.media-handling automount-open false" 2>&1 | tee -a "$LOGFILE"
-    su - "$target_user" -c "gsettings set org.gnome.desktop.media-handling autorun-never true" 2>&1 | tee -a "$LOGFILE"
-    ok "Automount disabled for $target_user."
+  if [ -z "$target_user" ] || [ "$target_user" = "root" ]; then
+    warn "Could not determine the logged-in desktop user — set automount off manually (see below)."
+  else
+    # Pick whichever media-handling schema exists on this desktop (GNOME, MATE, Cinnamon)
+    AM_SCHEMA=""
+    for sch in org.gnome.desktop.media-handling org.mate.media-handling org.cinnamon.desktop.media-handling; do
+      if gsettings list-schemas 2>/dev/null | grep -qx "$sch"; then AM_SCHEMA="$sch"; break; fi
+    done
+
+    if [ -z "$AM_SCHEMA" ]; then
+      warn "No media-handling gsettings schema found."
+    else
+      info "Using schema: $AM_SCHEMA (user: $target_user)"
+      cur="$(user_gsettings "$target_user" get "$AM_SCHEMA" automount 2>/dev/null)"
+      info "Current automount: ${cur:-unknown (no active desktop session found)}"
+
+      if [ "$HARDEN" -eq 1 ] && confirm "Disable automount/autorun for user '$target_user'?"; then
+        if user_gsettings "$target_user" set "$AM_SCHEMA" automount false &&
+           user_gsettings "$target_user" set "$AM_SCHEMA" automount-open false &&
+           user_gsettings "$target_user" set "$AM_SCHEMA" autorun-never true; then
+          ok "Automount disabled for $target_user (verified: automount=$(user_gsettings "$target_user" get "$AM_SCHEMA" automount))."
+        else
+          warn "Could not apply automount settings (no desktop session for $target_user?)."
+          warn "Do it manually, logged in as $target_user, in a normal terminal (no sudo):"
+          warn "  gsettings set $AM_SCHEMA automount false"
+          warn "  gsettings set $AM_SCHEMA automount-open false"
+          warn "  gsettings set $AM_SCHEMA autorun-never true"
+        fi
+      fi
+    fi
   fi
 fi
 
