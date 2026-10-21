@@ -19,6 +19,9 @@
 #                                              # compare accounts to the README roster
 #                                              # (lines: name:role[:password], role=admin|user)
 #
+# Before every y/N prompt the script prints a plain-English list of exactly
+# what it is about to do (and why), so you can decide before answering.
+#
 # All output is also written to a timestamped log file in the current
 # directory so you can review / backtrack what was done.
 #
@@ -71,9 +74,23 @@ backup_file() {
   fi
 }
 
+explain() {
+  # explain <step> [step...]   Prints a plain-English list of what is about to happen.
+  # A step beginning with "WHY:" is printed as the reason / a warning, not numbered.
+  local i=1 st
+  log "${C_CYAN}  What this will do:${C_RESET}"
+  for st in "$@"; do
+    case "$st" in
+      WHY:*) log "  ${C_BOLD}Why / note:${C_RESET} ${st#WHY:}" ;;
+      *)     log "    $i. $st"; i=$((i+1)) ;;
+    esac
+  done
+}
+
 confirm() {
-  # confirm "question" -> 0 if yes
-  local prompt="$1"
+  # confirm "question" [step ...] -> 0 if yes. Extra args are shown as numbered steps first.
+  local prompt="$1"; shift
+  if [ "$#" -gt 0 ]; then explain "$@"; fi
   if [ "$ASSUME_YES" -eq 1 ]; then
     return 0
   fi
@@ -83,7 +100,8 @@ confirm() {
 
 confirm_strict() {
   # Like confirm(), but ALWAYS asks — even with --yes. Used for destructive account changes.
-  local prompt="$1" reply
+  local prompt="$1" reply; shift
+  if [ "$#" -gt 0 ]; then explain "$@"; fi
   read -r -p "$(echo -e "${C_RED}?${C_RESET} ${prompt} [y/N] ")" reply
   [[ "$reply" =~ ^[Yy]$ ]]
 }
@@ -167,7 +185,11 @@ else
 fi
 
 if [ "$HARDEN" -eq 1 ] && [ "$UPGRADABLE" -gt 0 ]; then
-  if confirm "Run apt-get upgrade && apt-get dist-upgrade now? (can take a while, may prompt for config file choices)"; then
+  if confirm "Run apt-get upgrade && apt-get dist-upgrade now? (can take a while, may prompt for config file choices)" \
+        "Download and install newer versions of every installed package (apt-get upgrade)" \
+        "Also apply updates that add or remove packages, such as new kernels (apt-get dist-upgrade)" \
+        "This can take several minutes. If it asks about a config file, keeping the current version is usually safe" \
+        "WHY:Outdated software has known security holes, and updating is a commonly scored item"; then
     apt-get upgrade -y 2>&1 | tee -a "$LOGFILE"
     apt-get dist-upgrade -y 2>&1 | tee -a "$LOGFILE"
     ok "Updates applied."
@@ -206,24 +228,58 @@ hdr "3. Installed Software Audit"
 
 info "Package count: $(dpkg -l 2>/dev/null | grep -c '^ii')"
 
-SUSPECT_TOOLS=(netcat netcat-traditional ncat nmap john hydra metasploit-framework wireshark tshark aircrack-ng nikto sqlmap hashcat medusa ophcrack kismet ettercap-common tcpdump)
+SUSPECT_TOOLS=(netcat ncat nmap zenmap john hydra metasploit-framework wireshark tshark aircrack-ng nikto sqlmap hashcat medusa ophcrack kismet ettercap tcpdump dsniff fcrackzip)
 
-log "Checking for commonly-flagged security/hacking tools:"
+# installed_matches <tool> [include-removed-with-config]
+# Prints EVERY installed package whose name starts with <tool> (exactly like
+# `apt purge <tool>*`, e.g. netcat -> netcat-openbsd, nmap -> nmapsi4). The old check purged only the exact name, so
+# netcat-openbsd, wireshark-common, wireshark-qt, etc. were left behind.
+installed_matches() {
+  local tool="$1" want_rc="${2:-0}"
+  dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk -v t="$tool" -v rc="$want_rc" '
+    { st=$1; n=$2; sub(/:.*/,"",n)
+      if ((st=="ii" || st=="hi" || (rc==1 && st=="rc")) && index(n, t)==1) print n }' | sort -u
+}
+
+log "Checking for commonly-flagged security/hacking tools (matches the name AND variants like netcat-openbsd, wireshark-qt):"
 any_flagged=0
-for pkg in "${SUSPECT_TOOLS[@]}"; do
-  if dpkg -l 2>/dev/null | grep -qiE "^ii\s+${pkg}\b"; then
-    bad "Installed: $pkg  (remove if not explicitly required: sudo apt-get purge -y $pkg)"
+for tool in "${SUSPECT_TOOLS[@]}"; do
+  FOUND_PKGS="$(installed_matches "$tool" | tr '\n' ' ')"
+  if [ -n "${FOUND_PKGS// /}" ]; then
+    bad "Installed: $FOUND_PKGS (remove if not explicitly required: sudo apt-get purge -y $FOUND_PKGS)"
     any_flagged=1
   fi
 done
+
+# Snap / Flatpak copies are not seen by dpkg
+if command -v snap >/dev/null 2>&1; then
+  for tool in "${SUSPECT_TOOLS[@]}"; do
+    if snap list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$tool"; then
+      bad "Snap installed: $tool (remove: sudo snap remove --purge $tool)"; any_flagged=1
+    fi
+  done
+fi
+if command -v flatpak >/dev/null 2>&1; then
+  for tool in "${SUSPECT_TOOLS[@]}"; do
+    if flatpak list --columns=application 2>/dev/null | grep -qi "$tool"; then
+      bad "Flatpak installed matching: $tool (remove: flatpak uninstall <app-id>)"; any_flagged=1
+    fi
+  done
+fi
 [ "$any_flagged" -eq 0 ] && ok "None of the commonly-flagged tools were found installed."
 
 if [ "$HARDEN" -eq 1 ]; then
-  for pkg in "${SUSPECT_TOOLS[@]}"; do
-    if dpkg -l 2>/dev/null | grep -qiE "^ii\s+${pkg}\b"; then
-      if confirm "Purge package '$pkg'?"; then
-        apt-get purge -y "$pkg" 2>&1 | tee -a "$LOGFILE"
-      fi
+  for tool in "${SUSPECT_TOOLS[@]}"; do
+    PURGE_PKGS="$(installed_matches "$tool" 1 | tr '\n' ' ')"
+    [ -z "${PURGE_PKGS// /}" ] && continue
+    if confirm "Purge '$tool' and all its related packages?" \
+        "Completely remove these packages and their config files (like apt purge ${tool}*): $PURGE_PKGS" \
+        "Afterwards, leftover libraries are cleaned by the autoremove step in section 26" \
+        "WHY:This is a tool often used for hacking or network snooping. Check the README first: if it is listed as a REQUIRED program, answer n"; then
+      # shellcheck disable=SC2086
+      apt-get purge -y $PURGE_PKGS 2>&1 | tee -a "$LOGFILE"
+      LEFT="$(installed_matches "$tool" | tr '\n' ' ')"
+      if [ -z "${LEFT// /}" ]; then ok "'$tool' packages removed."; else bad "Still installed after purge: $LEFT (see log)"; fi
     fi
   done
 fi
@@ -235,7 +291,10 @@ info "Checking for Samba packages (often unneeded, exposes file-sharing services
 if dpkg -l 2>/dev/null | grep -qiE '^ii\s+samba'; then
   bad "Samba is installed."
   dpkg -l 2>/dev/null | grep -iE '^ii\s+samba' | tee -a "$LOGFILE"
-  if [ "$HARDEN" -eq 1 ] && confirm "Remove all samba* packages?"; then
+  if [ "$HARDEN" -eq 1 ] && confirm "Remove all samba* packages?" \
+        "Remove every Samba package (the Windows file-sharing service)" \
+        "That stops the service and closes its network ports" \
+        "WHY:Unneeded services add attack surface. Answer n if the README says Samba/file sharing is required"; then
     apt-get remove -y 'samba*' 2>&1 | tee -a "$LOGFILE"
     ok "Samba removed."
   fi
@@ -415,7 +474,11 @@ if [ -n "${ROSTER_FILE:-}" ]; then
   fi
 elif [ -r ./users.roster ]; then
   info "Loading roster from ./users.roster"; load_roster_file ./users.roster
-elif [ -t 0 ] && confirm_strict "Enter the authorized users from the README now (admins, standard users, optional passwords)?"; then
+elif [ -t 0 ] && confirm_strict "Enter the authorized users from the README now (admins, standard users, optional passwords)?" \
+        "You will type the authorized ADMINS (people allowed to use sudo), then the authorized STANDARD users" \
+        "For each person type: name   or   name:password" \
+        "Nothing is changed yet. This only builds the list the system gets compared against" \
+        "WHY:Lets the script spot users who should not exist and sudoers who should be normal users"; then
   read_roster_interactive
 fi
 
@@ -473,7 +536,11 @@ else
     info "Audit-only run: no account changes made. Re-run with --harden to be prompted for each change."
   elif [ "${#EXTRA[@]}" -eq 0 ] && [ "${#DEMOTE[@]}" -eq 0 ] && [ "${#PROMOTE[@]}" -eq 0 ] && [ "${#MISSING[@]}" -eq 0 ]; then
     ok "Nothing to change — accounts match the roster."
-  elif confirm_strict "Roster above looks correct (typos here would delete the wrong users). Continue with prompted changes?"; then
+  elif confirm_strict "Roster above looks correct (typos here would delete the wrong users). Continue with prompted changes?" \
+        "Back up /etc/passwd, /etc/shadow, /etc/group and /etc/gshadow" \
+        "Go through each difference one at a time: users to remove, sudo roles to fix, missing users to add" \
+        "Every delete or demotion still asks you again before it happens" \
+        "WHY:A typo in the roster could remove the wrong person, so check the table above first"; then
     for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do backup_file "$f"; done
 
     # ---- 2) remove users that shouldn't be there ----
@@ -486,9 +553,15 @@ else
       read -r -p "  [d]elete / [l]ock / [s]kip '$u'? [s] " choice
       case "$choice" in
         d|D)
-          if confirm_strict "  Really DELETE '$u'? This cannot be undone."; then
+          if confirm_strict "  Really DELETE '$u'? This cannot be undone." \
+        "Kill any running programs owned by '$u'" \
+        "Remove their scheduled cron jobs" \
+        "Delete the account (userdel). You will be asked next whether to delete their home folder too" \
+        "WHY:This cannot be undone. Make sure no forensics question needs this user"; then
             rmflag=""
-            confirm_strict "  Also delete the home directory $(getent passwd "$u" | cut -d: -f6)?" && rmflag="-r"
+            confirm_strict "  Also delete the home directory $(getent passwd "$u" | cut -d: -f6)?" \
+        "Delete the whole home folder and everything in it (documents, downloads, settings)" \
+        "WHY:Answer n to keep the files, for example if a forensics question may need them" && rmflag="-r"
             pkill -KILL -u "$u" 2>/dev/null || true
             crontab -r -u "$u" 2>/dev/null || true
             if userdel $rmflag "$u" >>"$LOGFILE" 2>&1; then ok "Deleted user '$u'."; else bad "userdel failed for '$u' (see log)."; fi
@@ -505,7 +578,10 @@ else
     for u in "${DEMOTE[@]}"; do
       warn "'$u' is a sudoer but the roster lists them as a STANDARD user."
       if is_protected "$u"; then warn "  '$u' is the account running this script — skipping."; continue; fi
-      if confirm_strict "  Remove '$u' from the sudo/admin/wheel group(s)?"; then
+      if confirm_strict "  Remove '$u' from the sudo/admin/wheel group(s)?" \
+        "Remove '$u' from the groups that give administrator rights (sudo, admin, wheel)" \
+        "They keep their account and files but can no longer run commands with sudo" \
+        "WHY:The README lists them as a standard user, so admin rights here count as a problem"; then
         for g in sudo admin wheel; do
           if getent group "$g" >/dev/null 2>&1 && id -nG "$u" | tr ' ' '\n' | grep -qx "$g"; then
             gpasswd -d "$u" "$g" >>"$LOGFILE" 2>&1 && ok "Removed '$u' from group '$g'."
@@ -522,7 +598,9 @@ else
 
     for u in "${PROMOTE[@]}"; do
       warn "'$u' is an authorized ADMIN but is not in a sudo group."
-      if [ -n "$ADMIN_GROUP" ] && confirm "  Add '$u' to group '$ADMIN_GROUP'?"; then
+      if [ -n "$ADMIN_GROUP" ] && confirm "  Add '$u' to group '$ADMIN_GROUP'?" \
+        "Add '$u' to the '$ADMIN_GROUP' group so they can use sudo" \
+        "WHY:The README lists them as an authorized administrator"; then
         usermod -aG "$ADMIN_GROUP" "$u" >>"$LOGFILE" 2>&1 && ok "Added '$u' to '$ADMIN_GROUP'."
       fi
     done
@@ -531,7 +609,11 @@ else
     for u in "${MISSING[@]}"; do
       role="${ROSTER_ROLE[$u]}"
       info "'$u' is on the roster as $role but has no account."
-      if confirm "  Create account '$u' ($role)?"; then
+      if confirm "  Create account '$u' ($role)?" \
+        "Create the account '$u' with a home folder and the bash shell (useradd)" \
+        "If they are an admin, add them to the sudo group" \
+        "Set their password from the roster, or ask you to type one" \
+        "WHY:The README lists them as authorized but they have no account"; then
         if useradd -m -s /bin/bash "$u" >>"$LOGFILE" 2>&1 && getent passwd "$u" >/dev/null 2>&1; then
           ok "Created user '$u'."
           if [ "$role" = "admin" ] && [ -n "$ADMIN_GROUP" ]; then
@@ -551,7 +633,9 @@ else
     # ---- optional: apply roster passwords to EXISTING accounts ----
     for u in "${ROSTER_ORDER[@]}"; do
       [ -n "${ROSTER_PW[$u]+x}" ] && [ -n "${SYS_SET[$u]+x}" ] || continue
-      if confirm_strict "Set EXISTING user '$u' password to the roster value? (default no)"; then
+      if confirm_strict "Set EXISTING user '$u' password to the roster value? (default no)" \
+        "Change '$u' password to the one you gave in the roster" \
+        "WHY:Only do this if you want to force a specific password. Answer n to leave it alone"; then
         printf '%s:%s\n' "$u" "${ROSTER_PW[$u]}" | chpasswd && ok "Password updated for '$u'."
       fi
     done
@@ -569,7 +653,10 @@ if [ -f /etc/login.defs ]; then
 fi
 
 if [ "$HARDEN" -eq 1 ]; then
-  if confirm "Apply recommended password aging (MAX=90, MIN=0, WARN=7) in /etc/login.defs?"; then
+  if confirm "Apply recommended password aging (MAX=90, MIN=0, WARN=7) in /etc/login.defs?" \
+        "Back up /etc/login.defs" \
+        "Passwords expire after 90 days, warn users 7 days before, and may change at any time" \
+        "WHY:Password expiration is a commonly scored item. These defaults apply to NEW accounts; existing accounts need the chage command"; then
     backup_file /etc/login.defs
     sed -i -E 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   90/' /etc/login.defs
     sed -i -E 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS   0/' /etc/login.defs
@@ -577,7 +664,11 @@ if [ "$HARDEN" -eq 1 ]; then
     ok "Updated /etc/login.defs"
   fi
 
-  if confirm "Install libpam-cracklib and enforce password complexity + reuse history (5) / minlen 8?"; then
+  if confirm "Install libpam-cracklib and enforce password complexity + reuse history (5) / minlen 8?" \
+        "Install libpam-cracklib (a password-strength checker)" \
+        "Back up /etc/pam.d/common-password" \
+        "Require 8+ characters with upper, lower, number and symbol, and block reusing the last 5 passwords" \
+        "WHY:Weak password rules are scored. This only applies when someone CHANGES a password"; then
     apt-get install -y libpam-cracklib 2>&1 | tee -a "$LOGFILE"
     backup_file /etc/pam.d/common-password
     # Add remember=5 minlen=8 to the pam_unix.so line, if not already present
@@ -591,7 +682,11 @@ if [ "$HARDEN" -eq 1 ]; then
     ok "Updated /etc/pam.d/common-password (backup saved)"
   fi
 
-  if confirm "Add account lockout after 5 failed attempts (30 min unlock) to /etc/pam.d/common-auth?"; then
+  if confirm "Add account lockout after 5 failed attempts (30 min unlock) to /etc/pam.d/common-auth?" \
+        "Back up /etc/pam.d/common-auth" \
+        "Check which lockout module this system has (pam_tally2 or pam_faillock). If neither exists it is skipped, so you cannot get locked out" \
+        "Lock an account for 30 minutes after 5 wrong passwords" \
+        "WHY:Account lockout is a scored item. Keep a second terminal open with sudo -i while you test it"; then
     # pam_tally2 was removed in newer releases (Ubuntu 22.04+/Mint 21+); using a missing
     # module in a 'required' line breaks ALL authentication (sudo, su, login).
     # So: detect which module actually exists, and never touch the file otherwise.
@@ -642,7 +737,10 @@ else
 fi
 
 if [ "$HARDEN" -eq 1 ] && [ -f /etc/securetty ]; then
-  if confirm "Clear /etc/securetty to disable root logins on all local ttys?"; then
+  if confirm "Clear /etc/securetty to disable root logins on all local ttys?" \
+        "Back up /etc/securetty" \
+        "Empty the list of terminals that root is allowed to log in on" \
+        "WHY:Stops root from logging in directly at a console"; then
     backup_file /etc/securetty
     : > /etc/securetty
     ok "/etc/securetty cleared."
@@ -653,10 +751,15 @@ info "Root account lock status:"
 passwd -S root 2>&1 | tee -a "$LOGFILE"
 
 if [ "$HARDEN" -eq 1 ]; then
-  if confirm "Lock the root account (passwd -l root) so it cannot log in with a password at all?"; then
+  if confirm "Lock the root account (passwd -l root) so it cannot log in with a password at all?" \
+        "Run passwd -l root, which locks the root password" \
+        "Admins can still use sudo. Only logging in directly as root with a password is blocked" \
+        "WHY:Make sure at least one admin user with sudo exists before you do this"; then
     passwd -l root 2>&1 | tee -a "$LOGFILE"
     ok "Root account locked."
-  elif confirm "Instead, set/reset the root account password now (interactive)?"; then
+  elif confirm "Instead, set/reset the root account password now (interactive)?" \
+        "Run passwd root. You will type a new password twice" \
+        "WHY:Use this if the root password is weak or blank"; then
     passwd root
   fi
 fi
@@ -674,7 +777,11 @@ if [ -f /etc/ssh/sshd_config ]; then
   fi
 
   if [ "$HARDEN" -eq 1 ]; then
-    if confirm "Set 'PermitRootLogin no' in /etc/ssh/sshd_config and restart sshd?"; then
+    if confirm "Set 'PermitRootLogin no' in /etc/ssh/sshd_config and restart sshd?" \
+        "Back up /etc/ssh/sshd_config" \
+        "Set PermitRootLogin no" \
+        "Restart the SSH service (this briefly drops any open SSH connections, not your desktop)" \
+        "WHY:Stops anyone logging in over SSH as root"; then
       backup_file /etc/ssh/sshd_config
       if grep -qF 'PermitRootLogin' /etc/ssh/sshd_config; then
         sed -i 's/^.*PermitRootLogin.*$/PermitRootLogin no/' /etc/ssh/sshd_config
@@ -696,7 +803,9 @@ hdr "6. Firewall (UFW)"
 
 if ! command -v ufw >/dev/null 2>&1; then
   warn "ufw not installed."
-  if [ "$HARDEN" -eq 1 ] && confirm "Install ufw?"; then
+  if [ "$HARDEN" -eq 1 ] && confirm "Install ufw?" \
+        "Install ufw, the Uncomplicated Firewall" \
+        "WHY:A firewall is a commonly scored item"; then
     apt-get install -y ufw 2>&1 | tee -a "$LOGFILE"
   fi
 fi
@@ -705,7 +814,10 @@ if command -v ufw >/dev/null 2>&1; then
   info "Current ufw status:"
   ufw status verbose | tee -a "$LOGFILE"
   if [ "$HARDEN" -eq 1 ]; then
-    if confirm "Enable ufw now?"; then
+    if confirm "Enable ufw now?" \
+        "Turn the firewall on (ufw enable). By default it blocks incoming connections" \
+        "Afterwards allow anything the README requires, for example: sudo ufw allow 443/tcp" \
+        "WHY:An enabled firewall is a commonly scored item"; then
       ufw --force enable 2>&1 | tee -a "$LOGFILE"
       ufw status verbose | tee -a "$LOGFILE"
     fi
@@ -721,7 +833,9 @@ hdr "7. Rootkit / Malware Scan"
 for tool in rkhunter chkrootkit; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     warn "$tool not installed."
-    if [ "$HARDEN" -eq 1 ] && confirm "Install $tool?"; then
+    if [ "$HARDEN" -eq 1 ] && confirm "Install $tool?" \
+        "Install $tool, a scanner that looks for rootkits (hidden malware)" \
+        "WHY:Scanning only reports findings. It does not delete anything on its own"; then
       apt-get install -y "$tool" 2>&1 | tee -a "$LOGFILE"
     fi
   fi
@@ -747,7 +861,9 @@ hdr "8. Auditd"
 
 if ! command -v auditctl >/dev/null 2>&1; then
   warn "auditd not installed."
-  if [ "$HARDEN" -eq 1 ] && confirm "Install and enable auditd?"; then
+  if [ "$HARDEN" -eq 1 ] && confirm "Install and enable auditd?" \
+        "Install auditd, which records security events such as logins and file changes" \
+        "Start it now and make it start at every boot"; then
     apt-get install -y auditd audispd-plugins 2>&1 | tee -a "$LOGFILE"
     systemctl enable --now auditd 2>&1 | tee -a "$LOGFILE"
     auditctl -e 1 2>&1 | tee -a "$LOGFILE"
@@ -832,7 +948,10 @@ check_perm /var/tmp 1777
 info "/etc/shadow and /etc/gshadow permissions (should be 640 or stricter, owned root):"
 ls -l /etc/shadow /etc/gshadow 2>/dev/null | tee -a "$LOGFILE"
 if [ "$HARDEN" -eq 1 ]; then
-  if confirm "Force /etc/shadow and /etc/gshadow to root:shadow 640?"; then
+  if confirm "Force /etc/shadow and /etc/gshadow to root:shadow 640?" \
+        "Set the owner of /etc/shadow and /etc/gshadow to root, group shadow" \
+        "Set permissions to 640 so only root and the shadow group can read password hashes" \
+        "WHY:Loose permissions here let normal users read password hashes"; then
     chown root:shadow /etc/shadow /etc/gshadow 2>/dev/null
     chmod 640 /etc/shadow /etc/gshadow 2>/dev/null
     ok "Permissions enforced."
@@ -869,7 +988,9 @@ FOUND_RHOSTS="$(find /root /home -name '.rhosts' 2>/dev/null)"
 [ -n "$FOUND_RHOSTS" ] && bad "Found: $FOUND_RHOSTS" || ok "No .rhosts files found."
 if [ -f /etc/hosts.equiv ]; then
   bad "/etc/hosts.equiv exists — this is a legacy trust-auth bypass."
-  if [ "$HARDEN" -eq 1 ] && confirm "Delete /etc/hosts.equiv?"; then
+  if [ "$HARDEN" -eq 1 ] && confirm "Delete /etc/hosts.equiv?" \
+        "Back up, then delete /etc/hosts.equiv" \
+        "WHY:This old file lets other computers log in without a password"; then
     backup_file /etc/hosts.equiv
     rm -f /etc/hosts.equiv
     ok "Removed."
@@ -878,7 +999,9 @@ else
   ok "/etc/hosts.equiv not present."
 fi
 if [ "$HARDEN" -eq 1 ] && [ -n "$FOUND_RHOSTS" ]; then
-  if confirm "Delete all found .rhosts files?"; then
+  if confirm "Delete all found .rhosts files?" \
+        "Delete every .rhosts file under /root and /home (no backup is made)" \
+        "WHY:These old files let other computers log in without a password"; then
     find /root /home -name '.rhosts' -delete 2>/dev/null
     ok "Removed."
   fi
@@ -911,7 +1034,12 @@ for key in "${!SYSCTL_CHECKS[@]}"; do
 done
 
 if [ "$HARDEN" -eq 1 ]; then
-  if confirm "Write recommended values to /etc/sysctl.d/99-zz-hardening.conf and apply now?"; then
+  if confirm "Write recommended values to /etc/sysctl.d/99-zz-hardening.conf and apply now?" \
+        "Create /etc/sysctl.d/99-zz-hardening.conf with safer network settings (no IP forwarding, ignore redirects, SYN-flood protection, log suspicious packets)" \
+        "Remove the older 99-hardening.conf if it exists (it is backed up first)" \
+        "Apply the settings right now and keep them after a reboot" \
+        "Then look for other config files that would undo these settings" \
+        "WHY:Kernel network hardening is a commonly scored item"; then
     # Named 99-zz-* so it sorts AFTER other files (e.g. 99-sysctl.conf -> /etc/sysctl.conf).
     # With the old name (99-hardening.conf), a later file could silently override it,
     # which made the same FLAG reappear on every run / after reboot.
@@ -955,7 +1083,10 @@ if [ "$HARDEN" -eq 1 ]; then
       echo "$CONFLICTS" | while IFS='|' read -r f k v; do
         [ -n "$f" ] && warn "  $f: $k = $v"
       done | tee -a "$LOGFILE"
-      if confirm "Comment out those conflicting lines (backups are made first)?"; then
+      if confirm "Comment out those conflicting lines (backups are made first)?" \
+        "Back up each file that sets one of these values differently" \
+        "Put a # in front of those lines so they stop applying" \
+        "WHY:Otherwise those lines override our safe values after a reboot"; then
         echo "$CONFLICTS" | cut -d'|' -f1 | sort -u | while read -r f; do
           [ -z "$f" ] && continue
           [ -L "$f" ] && f="$(readlink -f "$f")"
@@ -997,7 +1128,12 @@ if [ -f /etc/ssh/sshd_config ]; then
   grep -iE '^\s*(PermitEmptyPasswords|X11Forwarding|MaxAuthTries|Protocol)' /etc/ssh/sshd_config | tee -a "$LOGFILE"
 
   if [ "$HARDEN" -eq 1 ]; then
-    if confirm "Apply hardened SSH settings (PermitEmptyPasswords no, X11Forwarding no, MaxAuthTries 3) and restart sshd?"; then
+    if confirm "Apply hardened SSH settings (PermitEmptyPasswords no, X11Forwarding no, MaxAuthTries 3) and restart sshd?" \
+        "Back up /etc/ssh/sshd_config" \
+        "PermitEmptyPasswords no: no logging in over SSH with a blank password" \
+        "X11Forwarding no: turn off remote graphical forwarding" \
+        "MaxAuthTries 3: allow only 3 password attempts per connection" \
+        "Restart the SSH service"; then
       backup_file /etc/ssh/sshd_config
       for pair in "PermitEmptyPasswords no" "X11Forwarding no" "MaxAuthTries 3"; do
         key="${pair%% *}"
@@ -1049,7 +1185,10 @@ for pair in "cron:/etc/cron.allow:/etc/cron.deny" "at:/etc/at.allow:/etc/at.deny
     ok "$allow exists — access restricted to listed users: $(cat "$allow" | tr '\n' ' ')"
   else
     warn "$allow does not exist for $name — by default this may allow all users. Consider creating it with just 'root'."
-    if [ "$HARDEN" -eq 1 ] && confirm "Create $allow containing only 'root'?"; then
+    if [ "$HARDEN" -eq 1 ] && confirm "Create $allow containing only 'root'?" \
+        "Create $allow listing only root (permissions 600)" \
+        "Only root may use this scheduler. Other users are blocked" \
+        "WHY:Answer n if the README says a normal user needs scheduled jobs"; then
       echo root > "$allow"
       chmod 600 "$allow"
       ok "Created $allow"
@@ -1069,7 +1208,9 @@ info "Current /etc/issue.net:"
 cat /etc/issue.net 2>/dev/null | tee -a "$LOGFILE"
 
 if [ "$HARDEN" -eq 1 ]; then
-  if confirm "Set a generic 'Authorized use only' warning banner in /etc/issue and /etc/issue.net?"; then
+  if confirm "Set a generic 'Authorized use only' warning banner in /etc/issue and /etc/issue.net?" \
+        "Back up /etc/issue and /etc/issue.net" \
+        "Replace both with a short warning that only authorized users may log in"; then
     backup_file /etc/issue
     backup_file /etc/issue.net
     BANNER="Authorized access only. By accessing this system you consent to monitoring."
@@ -1086,7 +1227,10 @@ hdr "20. Antivirus (ClamAV)"
 
 if ! command -v clamscan >/dev/null 2>&1; then
   warn "ClamAV not installed."
-  if [ "$HARDEN" -eq 1 ] && confirm "Install ClamAV and update virus definitions?"; then
+  if [ "$HARDEN" -eq 1 ] && confirm "Install ClamAV and update virus definitions?" \
+        "Install the ClamAV antivirus" \
+        "Briefly stop its update service, download the newest virus definitions (freshclam), then restart it" \
+        "WHY:This does NOT start a scan. A full scan takes a long time and is run separately"; then
     apt-get install -y clamav clamav-daemon 2>&1 | tee -a "$LOGFILE"
     systemctl stop clamav-freshclam 2>/dev/null
     freshclam 2>&1 | tee -a "$LOGFILE"
@@ -1108,7 +1252,10 @@ if command -v aa-status >/dev/null 2>&1; then
   aa-status 2>&1 | tee -a "$LOGFILE"
 else
   warn "AppArmor tools not installed."
-  if [ "$HARDEN" -eq 1 ] && confirm "Install apparmor + apparmor-utils and enable it?"; then
+  if [ "$HARDEN" -eq 1 ] && confirm "Install apparmor + apparmor-utils and enable it?" \
+        "Install AppArmor and its tools" \
+        "Enable it at boot and start it now" \
+        "WHY:AppArmor limits what each program is allowed to do, which helps contain attacks"; then
     apt-get install -y apparmor apparmor-utils 2>&1 | tee -a "$LOGFILE"
     systemctl enable --now apparmor 2>&1 | tee -a "$LOGFILE"
     ok "AppArmor installed and enabled."
@@ -1126,7 +1273,8 @@ if command -v timedatectl >/dev/null 2>&1; then
     ok "Time sync appears active."
   else
     warn "Time sync does not appear active."
-    if [ "$HARDEN" -eq 1 ] && confirm "Enable systemd-timesyncd?"; then
+    if [ "$HARDEN" -eq 1 ] && confirm "Enable systemd-timesyncd?" \
+        "Turn on automatic clock synchronization (timedatectl set-ntp true)"; then
       timedatectl set-ntp true 2>&1 | tee -a "$LOGFILE"
     fi
   fi
@@ -1141,7 +1289,10 @@ if dpkg -l 2>/dev/null | grep -qi '^ii\s\+unattended-upgrades'; then
   ok "unattended-upgrades is installed."
 else
   warn "unattended-upgrades not installed — system won't auto-apply security patches."
-  if [ "$HARDEN" -eq 1 ] && confirm "Install and enable unattended-upgrades?"; then
+  if [ "$HARDEN" -eq 1 ] && confirm "Install and enable unattended-upgrades?" \
+        "Install unattended-upgrades" \
+        "Run its setup so security updates install on their own" \
+        "WHY:Automatic security updates are a commonly scored item"; then
     apt-get install -y unattended-upgrades 2>&1 | tee -a "$LOGFILE"
     dpkg-reconfigure -plow unattended-upgrades 2>&1 | tee -a "$LOGFILE"
     ok "unattended-upgrades installed."
@@ -1179,7 +1330,11 @@ else
     warn "$AUTO_CONF not found."
   fi
 
-  if [ "$HARDEN" -eq 1 ] && confirm "Set apt to check daily and auto download/install security updates ($AUTO_CONF)?"; then
+  if [ "$HARDEN" -eq 1 ] && confirm "Set apt to check daily and auto download/install security updates ($AUTO_CONF)?" \
+        "Install unattended-upgrades if it is missing" \
+        "Back up the current $AUTO_CONF" \
+        "Check for new updates every day, download them, and install security updates automatically" \
+        "WHY:Matches the Software Updates settings: check Daily, install security updates automatically"; then
     apt-get install -y unattended-upgrades 2>&1 | tee -a "$LOGFILE"
     backup_file "$AUTO_CONF"
     cat > "$AUTO_CONF" <<'AUTOEOF'
@@ -1219,7 +1374,11 @@ AUTOEOF
     warn "ufw not installed (see section 6)."
   else
     info "Checklist: sudo ufw enable; sudo ufw default reject incoming; sudo ufw default allow outgoing"
-    if [ "$HARDEN" -eq 1 ] && confirm "Set ufw defaults (reject incoming, allow outgoing) and enable ufw?"; then
+    if [ "$HARDEN" -eq 1 ] && confirm "Set ufw defaults (reject incoming, allow outgoing) and enable ufw?" \
+        "Turn the firewall on" \
+        "Reject all incoming connections by default" \
+        "Allow all outgoing connections" \
+        "WHY:Allow any service the README needs afterwards, for example: sudo ufw allow ssh"; then
       ufw --force enable 2>&1 | tee -a "$LOGFILE"
       ufw default reject incoming 2>&1 | tee -a "$LOGFILE"
       ufw default allow outgoing 2>&1 | tee -a "$LOGFILE"
@@ -1272,7 +1431,10 @@ else
     fi
   done
   info "Checklist: sudo systemctl stop vsftpd && sudo apt purge vsftpd   (answer y at the prompt)"
-  if [ "$HARDEN" -eq 1 ] && confirm "Stop and purge FTP server package(s):$FTP_FOUND ?"; then
+  if [ "$HARDEN" -eq 1 ] && confirm "Stop and purge FTP server package(s):$FTP_FOUND ?" \
+        "Stop and disable each FTP service that is running" \
+        "Purge the FTP package(s):$FTP_FOUND (removes the program and its config)" \
+        "WHY:FTP sends passwords unencrypted. Answer n if the README says FTP is required"; then
     for pkg in $FTP_FOUND; do
       svc="$pkg"
       case "$pkg" in proftpd-basic) svc="proftpd" ;; pure-ftpd-common) svc="pure-ftpd" ;; esac
@@ -1296,7 +1458,9 @@ info "  -> enable 'Apply updates automatically'. (Use your account password from
 
 if command -v mintupdate-automation >/dev/null 2>&1; then
   info "mintupdate-automation is available."
-  if [ "$HARDEN" -eq 1 ] && confirm "Enable Update Manager 'Apply updates automatically' (mintupdate-automation upgrade enable)?"; then
+  if [ "$HARDEN" -eq 1 ] && confirm "Enable Update Manager 'Apply updates automatically' (mintupdate-automation upgrade enable)?" \
+        "Run mintupdate-automation upgrade enable" \
+        "This is the same as turning on Apply updates automatically in Update Manager > Preferences > Automation"; then
     if mintupdate-automation upgrade enable 2>&1 | tee -a "$LOGFILE"; then
       ok "Requested: Apply updates automatically. Verify in Update Manager -> Preferences -> Automation."
     else
@@ -1339,11 +1503,16 @@ fi
 info "Install updates (important security updates):"
 info "  GUI: Update Manager -> Refresh -> Install Updates   (auto-apply must be set in Preferences first)"
 info "  CLI: sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove --purge -y"
-if [ "$HARDEN" -eq 1 ] && confirm "Run apt-get update && apt-get full-upgrade -y now?"; then
+if [ "$HARDEN" -eq 1 ] && confirm "Run apt-get update && apt-get full-upgrade -y now?" \
+        "Refresh the list of available updates (apt-get update)" \
+        "Install every available update, including ones that add or remove packages (apt-get full-upgrade -y)" \
+        "This can take several minutes"; then
   apt-get update 2>&1 | tee -a "$LOGFILE"
   apt-get full-upgrade -y 2>&1 | tee -a "$LOGFILE"
   ok "apt full-upgrade complete."
-  if confirm "Also remove unneeded packages and their config (apt-get autoremove --purge -y)?"; then
+  if confirm "Also remove unneeded packages and their config (apt-get autoremove --purge -y)?" \
+        "Remove packages that were installed automatically and are no longer needed" \
+        "--purge also deletes their leftover config files"; then
     apt-get autoremove --purge -y 2>&1 | tee -a "$LOGFILE"
     ok "apt autoremove --purge complete."
   fi
@@ -1372,7 +1541,11 @@ if command -v gsettings >/dev/null 2>&1; then
       cur="$(user_gsettings "$target_user" get "$AM_SCHEMA" automount 2>/dev/null)"
       info "Current automount: ${cur:-unknown (no active desktop session found)}"
 
-      if [ "$HARDEN" -eq 1 ] && confirm "Disable automount/autorun for user '$target_user'?"; then
+      if [ "$HARDEN" -eq 1 ] && confirm "Disable automount/autorun for user '$target_user'?" \
+        "Turn off automatic mounting of USB drives and disks for $target_user" \
+        "Turn off automatically opening removable media" \
+        "Never auto-run programs from removable media" \
+        "This runs inside $target_user desktop session, so it only works while they are logged in"; then
         if user_gsettings "$target_user" set "$AM_SCHEMA" automount false &&
            user_gsettings "$target_user" set "$AM_SCHEMA" automount-open false &&
            user_gsettings "$target_user" set "$AM_SCHEMA" autorun-never true; then
@@ -1402,7 +1575,9 @@ vcheck() {
 }
 
 # 1) Updates: refresh the list, then count what's still pending
-if [ "$HARDEN" -eq 1 ] && confirm "Refresh the package list now (apt-get update) before counting pending updates?"; then
+if [ "$HARDEN" -eq 1 ] && confirm "Refresh the package list now (apt-get update) before counting pending updates?" \
+        "Download the latest list of available package versions (apt-get update)" \
+        "WHY:Installs nothing. It only makes the pending-update count below accurate"; then
   apt-get update >>"$LOGFILE" 2>&1
 fi
 PENDING="$(apt list --upgradable 2>/dev/null | grep -c 'upgradable')"
@@ -1441,6 +1616,14 @@ for pkg in vsftpd proftpd-basic proftpd pure-ftpd pure-ftpd-common; do
   dpkg -l "$pkg" 2>/dev/null | grep -q '^ii' && FTP_LEFT="$FTP_LEFT $pkg"
 done
 vcheck "No FTP server installed" "$([ -z "$FTP_LEFT" ] && echo 0 || echo 1)" "still installed:$FTP_LEFT"
+
+# 6b) Hacking/analysis tools (including variants such as netcat-openbsd, wireshark-qt)
+LEFT_TOOLS=""
+for tool in "${SUSPECT_TOOLS[@]}"; do
+  L="$(installed_matches "$tool" | tr '\n' ' ')"
+  [ -n "${L// /}" ] && LEFT_TOOLS="$LEFT_TOOLS $L"
+done
+vcheck "No flagged hacking/analysis tools installed" "$([ -z "${LEFT_TOOLS// /}" ] && echo 0 || echo 1)" "still installed:$LEFT_TOOLS (skip any the README says are required)"
 
 # 7) Automount (needs the desktop session; uses values from the USB step)
 if [ -n "${AM_SCHEMA:-}" ] && [ -n "${target_user:-}" ]; then
