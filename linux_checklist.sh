@@ -1338,11 +1338,15 @@ fi
 
 info "Install updates (important security updates):"
 info "  GUI: Update Manager -> Refresh -> Install Updates   (auto-apply must be set in Preferences first)"
-info "  CLI: sudo apt update && sudo apt full-upgrade -y"
+info "  CLI: sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove --purge -y"
 if [ "$HARDEN" -eq 1 ] && confirm "Run apt-get update && apt-get full-upgrade -y now?"; then
   apt-get update 2>&1 | tee -a "$LOGFILE"
   apt-get full-upgrade -y 2>&1 | tee -a "$LOGFILE"
   ok "apt full-upgrade complete."
+  if confirm "Also remove unneeded packages and their config (apt-get autoremove --purge -y)?"; then
+    apt-get autoremove --purge -y 2>&1 | tee -a "$LOGFILE"
+    ok "apt autoremove --purge complete."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -1403,7 +1407,7 @@ if [ "$HARDEN" -eq 1 ] && confirm "Refresh the package list now (apt-get update)
 fi
 PENDING="$(apt list --upgradable 2>/dev/null | grep -c 'upgradable')"
 SEC_PENDING="$(apt list --upgradable 2>/dev/null | grep -ci 'security')"
-vcheck "No pending package updates" "$([ "${PENDING:-0}" -eq 0 ] && echo 0 || echo 1)" "$PENDING pending ($SEC_PENDING security) — run: sudo apt update && sudo apt full-upgrade -y"
+vcheck "No pending package updates" "$([ "${PENDING:-0}" -eq 0 ] && echo 0 || echo 1)" "$PENDING pending ($SEC_PENDING security) — run: sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove --purge -y"
 
 # 2) Automatic updates configured
 AU=/etc/apt/apt.conf.d/20auto-upgrades
