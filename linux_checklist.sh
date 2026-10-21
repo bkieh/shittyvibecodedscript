@@ -5,8 +5,8 @@
 # Debian / Linux Mint audit + hardening helper, based on the
 # "Ultimate Linux Checklist" (CyberPatriot-style) document,
 # plus an Ubuntu-specific checklist (section 24), FTP removal (25) and
-# Mint Update Manager / full-upgrade steps (26), and a roster-based
-# authorized-users check (5a), and a final re-verification pass.
+# Mint Update Manager / full-upgrade steps (26), an interactive user
+# review/manager (5a), and a final re-verification pass.
 #
 # USAGE:
 #   sudo ./linux_checklist.sh                 # audit only (safe, read-only)
@@ -15,9 +15,6 @@
 #   sudo ./linux_checklist.sh --harden --yes  # audit + apply changes with no
 #                                              # per-step prompts (use with care;
 #                                              # account deletions/demotions still ask)
-#   sudo ./linux_checklist.sh --roster=users.roster --harden
-#                                              # compare accounts to the README roster
-#                                              # (lines: name:role[:password], role=admin|user)
 #
 # Before every y/N prompt the script prints a plain-English list of exactly
 # what it is about to do (and why), so you can decide before answering.
@@ -40,15 +37,13 @@ TS="$(date +%Y%m%d-%H%M%S)"
 LOGFILE="./linux_checklist-${TS}.log"
 HARDEN=0
 ASSUME_YES=0
-ROSTER_FILE=""
 
 for arg in "$@"; do
   case "$arg" in
     --harden) HARDEN=1 ;;
     --yes|-y) ASSUME_YES=1 ;;
-    --roster=*) ROSTER_FILE="${arg#--roster=}" ;;
     --help|-h)
-      echo "Usage: $0 [--harden] [--yes] [--roster=FILE]"
+      echo "Usage: $0 [--harden] [--yes]"
       exit 0
       ;;
   esac
@@ -377,74 +372,20 @@ if command -v getent >/dev/null 2>&1 && [ -r /etc/shadow ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5a. Authorized Users Check (roster reconciliation)
+# 5a. User Accounts Review & Management
 #
-# Flow: load the roster (README list: user, role, optional password)
-#   1) "checksum": scan the system and show what MATCHES / what's EXTRA / what's MISSING
-#   2) prompt: users NOT on the roster -> delete / lock / skip
-#   3) prompt: sudoers who should be standard users -> demote
-#      (and roster admins who are missing sudo -> promote)
-#   4) prompt: roster users with no account -> create them (with password + role)
-# Destructive account actions ALWAYS prompt, even with --yes.
-# Roster formats:  --roster=FILE  or  ./users.roster  (lines:  name:role[:password])
-#                  role = admin | user.  Lines starting with # are comments.
-#                  Or answer the prompts interactively. Passwords are never logged.
+# Scans every real (human) account, shows its status (admin or standard) and password
+# info, then — with --harden — walks through each user and lets you change their
+# status, change their password, lock or delete them, and create new users.
+# Deleting a user or removing admin rights always asks, even with --yes.
+#
+# NOTE: Linux only stores a one-way HASH of each password, so real passwords can never
+# be displayed. The table shows whether a password is set, how it is stored, and when it
+# was last changed instead.
 # ---------------------------------------------------------------------------
-hdr "5a. Authorized Users Check (roster reconciliation)"
+hdr "5a. User Accounts Review & Management"
 
-declare -A ROSTER_ROLE=()
-declare -A ROSTER_PW=()
-ROSTER_ORDER=()
 INVOKER="$(logname 2>/dev/null || true)"
-
-norm_role() {
-  case "$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
-    admin|administrator|sudo|sudoer|sudoers|a) echo admin ;;
-    user|standard|normal|regular|u|"")         echo user ;;
-    *)                                         echo "" ;;
-  esac
-}
-
-roster_add() {
-  # roster_add <name> <role> <password-optional>
-  local name role pw="${3:-}"
-  name="$(echo "$1" | tr -d '[:space:]')"
-  role="$(norm_role "$2")"
-  [ -z "$name" ] && return 0
-  if [ "$name" = "root" ]; then warn "Roster entry 'root' ignored (root is never managed here)."; return 0; fi
-  if [ -z "$role" ]; then warn "Unknown role '$2' for '$name' — entry skipped (use admin or user)."; return 0; fi
-  if ! [[ "$name" =~ ^[a-z][-a-z0-9_]*$ ]]; then warn "Invalid username '$name' — entry skipped."; return 0; fi
-  if [ -z "${ROSTER_ROLE[$name]+x}" ]; then ROSTER_ORDER+=("$name"); fi
-  ROSTER_ROLE[$name]="$role"
-  if [ -n "$pw" ]; then ROSTER_PW[$name]="$pw"; fi
-}
-
-load_roster_file() {
-  local f="$1" line name role pw
-  while IFS= read -r line || [ -n "$line" ]; do
-    line="${line%$'\r'}"
-    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
-    IFS=: read -r name role pw <<<"$line"
-    roster_add "$name" "$role" "$pw"
-  done < "$f"
-}
-
-read_roster_interactive() {
-  local kind line name pw
-  for kind in admin user; do
-    if [ "$kind" = "admin" ]; then
-      echo "Authorized ADMINISTRATORS (sudoers) — one per line: name  or  name:password. Blank line = done."
-    else
-      echo "Authorized STANDARD users (NOT sudoers) — one per line: name  or  name:password. Blank line = done."
-    fi
-    while IFS= read -r -p "  > " line; do
-      [ -z "$line" ] && break
-      name="${line%%:*}"; pw=""
-      [[ "$line" == *:* ]] && pw="${line#*:}"
-      roster_add "$name" "$kind" "$pw"
-    done
-  done
-}
 
 list_human_users() {
   local min max
@@ -461,187 +402,178 @@ is_protected() {
   [ "$1" = "root" ] || { [ -n "$INVOKER" ] && [ "$1" = "$INVOKER" ]; } || { [ -n "${SUDO_USER:-}" ] && [ "$1" = "${SUDO_USER:-}" ]; }
 }
 
-pw_status() {
-  passwd -S "$1" 2>/dev/null | awk '{print $2}' || true
+pw_info() {
+  # Describes a user's password WITHOUT revealing it (only the hash exists on disk).
+  local u="$1" entry hash days algo changed="" note=""
+  entry="$(getent shadow "$u" 2>/dev/null || true)"
+  if [ -z "$entry" ]; then echo "unknown"; return; fi
+  hash="$(echo "$entry" | cut -d: -f2)"
+  days="$(echo "$entry" | cut -d: -f3)"
+  case "$hash" in
+    "")                echo "EMPTY - no password!"; return ;;
+    "*"|"!"|"!!"|"!*") echo "no password (password login disabled)"; return ;;
+  esac
+  if [[ "$hash" == '!'* ]]; then note="LOCKED, "; hash="${hash#!}"; fi
+  case "$hash" in
+    '$1$'*) algo="md5 (WEAK)" ;;
+    '$2'*)  algo="bcrypt" ;;
+    '$5$'*) algo="sha256" ;;
+    '$6$'*) algo="sha512" ;;
+    '$y$'*) algo="yescrypt" ;;
+    '$7$'*) algo="scrypt" ;;
+    *)      algo="unknown hash" ;;
+  esac
+  if [[ "$days" =~ ^[0-9]+$ ]] && [ "$days" -gt 0 ]; then
+    changed="$(date -d "@$((days*86400))" +%Y-%m-%d 2>/dev/null || true)"
+  fi
+  echo "${note}set, ${algo}${changed:+, changed $changed}"
 }
 
-# ---- load the roster ----
-if [ -n "${ROSTER_FILE:-}" ]; then
-  if [ -r "$ROSTER_FILE" ]; then
-    info "Loading roster from $ROSTER_FILE"; load_roster_file "$ROSTER_FILE"
-  else
-    warn "Roster file '$ROSTER_FILE' is not readable."
-  fi
-elif [ -r ./users.roster ]; then
-  info "Loading roster from ./users.roster"; load_roster_file ./users.roster
-elif [ -t 0 ] && confirm_strict "Enter the authorized users from the README now (admins, standard users, optional passwords)?" \
-        "You will type the authorized ADMINS (people allowed to use sudo), then the authorized STANDARD users" \
-        "For each person type: name   or   name:password" \
-        "Nothing is changed yet. This only builds the list the system gets compared against" \
-        "WHY:Lets the script spot users who should not exist and sudoers who should be normal users"; then
-  read_roster_interactive
-fi
-
-if [ "${#ROSTER_ORDER[@]}" -eq 0 ]; then
-  info "No roster loaded — skipping. (Use --roster=FILE, ./users.roster, or answer the prompt next time.)"
-else
-  mapfile -t SYS_USERS < <(list_human_users)
-  declare -A SYS_SET=()
-  for u in "${SYS_USERS[@]}"; do SYS_SET[$u]=1; done
-
-  EXTRA=(); MISSING=(); DEMOTE=(); PROMOTE=(); MATCHED=0; N_ADMIN=0; N_USER=0
-  for u in "${ROSTER_ORDER[@]}"; do
-    if [ "${ROSTER_ROLE[$u]}" = "admin" ]; then N_ADMIN=$((N_ADMIN+1)); else N_USER=$((N_USER+1)); fi
-  done
-  for u in "${SYS_USERS[@]}"; do
-    [ -z "${ROSTER_ROLE[$u]+x}" ] && EXTRA+=("$u")
-  done
-  for u in "${ROSTER_ORDER[@]}"; do
-    if [ -z "${SYS_SET[$u]+x}" ]; then MISSING+=("$u"); continue; fi
-    if is_sudoer "$u"; then cur_role=admin; else cur_role=user; fi
-    want_role="${ROSTER_ROLE[$u]}"
-    if   [ "$want_role" = "admin" ] && [ "$cur_role" = "user"  ]; then PROMOTE+=("$u")
-    elif [ "$want_role" = "user"  ] && [ "$cur_role" = "admin" ]; then DEMOTE+=("$u")
-    else MATCHED=$((MATCHED+1)); fi
-  done
-
-  # ---- 1) the "checksum": what you have vs. what you should have ----
-  info "Roster checksum: ${#ROSTER_ORDER[@]} authorized ($N_ADMIN admin, $N_USER standard)  vs  ${#SYS_USERS[@]} human account(s) on this system"
+show_user_table() {
+  local u st
   {
-    printf '  %-16s %-9s %-9s %-5s %s\n' "USER" "ON SYSTEM" "ROSTER" "PW" "RESULT"
-    for u in "${SYS_USERS[@]}"; do
-      if is_sudoer "$u"; then sr=admin; else sr=user; fi
-      rr="-"; res="NOT ON ROSTER"
-      if [ -n "${ROSTER_ROLE[$u]+x}" ]; then
-        rr="${ROSTER_ROLE[$u]}"
-        if [ "$rr" = "$sr" ]; then res="ok"
-        elif [ "$rr" = "admin" ]; then res="NEEDS SUDO"
-        else res="SHOULD NOT BE SUDOER"; fi
-      fi
-      printf '  %-16s %-9s %-9s %-5s %s\n' "$u" "$sr" "$rr" "$(pw_status "$u")" "$res"
-    done
-    for u in "${MISSING[@]}"; do
-      printf '  %-16s %-9s %-9s %-5s %s\n' "$u" "-" "${ROSTER_ROLE[$u]}" "-" "MISSING"
+    printf '  %-14s %-6s %-9s %-46s %s\n' "USER" "UID" "STATUS" "PASSWORD" "SHELL"
+    for u in $(list_human_users); do
+      if is_sudoer "$u"; then st="ADMIN"; else st="standard"; fi
+      printf '  %-14s %-6s %-9s %-46s %s\n' "$u" "$(id -u "$u")" "$st" "$(pw_info "$u")" "$(getent passwd "$u" | cut -d: -f7)"
     done
   } | tee -a "$LOGFILE"
+}
 
-  ok  "$MATCHED account(s) match the roster exactly."
-  [ "${#EXTRA[@]}"   -gt 0 ] && bad "On the system but NOT on the roster (${#EXTRA[@]}): ${EXTRA[*]}"
-  [ "${#DEMOTE[@]}"  -gt 0 ] && bad "Sudoers who should be standard users (${#DEMOTE[@]}): ${DEMOTE[*]}"
-  [ "${#PROMOTE[@]}" -gt 0 ] && warn "Roster admins without sudo (${#PROMOTE[@]}): ${PROMOTE[*]}"
-  [ "${#MISSING[@]}" -gt 0 ] && warn "On the roster but missing from the system (${#MISSING[@]}): ${MISSING[*]}"
-  info "Note: this checks group membership (sudo/admin/wheel). Direct entries in /etc/sudoers.d are covered by section 17."
+manage_user() {
+  # manage_user <name>: menu loop for one account
+  local u="$1" choice rmflag
+  while true; do
+    echo
+    info "User '$u': $(is_sudoer "$u" && echo ADMIN || echo standard) | groups: $(id -nG "$u" 2>/dev/null) | password: $(pw_info "$u")"
+    if is_protected "$u"; then info "  ('$u' is the account running this script: it can't be deleted, locked or demoted here)"; fi
+    read -r -p "  [Enter]=keep as is   [s]tatus (admin<->standard)   [p]assword   [l]ock   [d]elete  > " choice || return 0
+    case "$choice" in
+      ""|k|K) return 0 ;;
 
-  if [ "$HARDEN" -ne 1 ]; then
-    info "Audit-only run: no account changes made. Re-run with --harden to be prompted for each change."
-  elif [ "${#EXTRA[@]}" -eq 0 ] && [ "${#DEMOTE[@]}" -eq 0 ] && [ "${#PROMOTE[@]}" -eq 0 ] && [ "${#MISSING[@]}" -eq 0 ]; then
-    ok "Nothing to change — accounts match the roster."
-  elif confirm_strict "Roster above looks correct (typos here would delete the wrong users). Continue with prompted changes?" \
-        "Back up /etc/passwd, /etc/shadow, /etc/group and /etc/gshadow" \
-        "Go through each difference one at a time: users to remove, sudo roles to fix, missing users to add" \
-        "Every delete or demotion still asks you again before it happens" \
-        "WHY:A typo in the roster could remove the wrong person, so check the table above first"; then
-    for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do backup_file "$f"; done
-
-    # ---- 2) remove users that shouldn't be there ----
-    for u in "${EXTRA[@]}"; do
-      warn "'$u' is NOT on the roster (UID $(id -u "$u"), home $(getent passwd "$u" | cut -d: -f6), sudoer: $(is_sudoer "$u" && echo yes || echo no))"
-      if is_protected "$u"; then
-        warn "  '$u' is the account running this script — skipping (remove manually if intended)."
-        continue
-      fi
-      read -r -p "  [d]elete / [l]ock / [s]kip '$u'? [s] " choice
-      case "$choice" in
-        d|D)
-          if confirm_strict "  Really DELETE '$u'? This cannot be undone." \
-        "Kill any running programs owned by '$u'" \
-        "Remove their scheduled cron jobs" \
-        "Delete the account (userdel). You will be asked next whether to delete their home folder too" \
-        "WHY:This cannot be undone. Make sure no forensics question needs this user"; then
-            rmflag=""
-            confirm_strict "  Also delete the home directory $(getent passwd "$u" | cut -d: -f6)?" \
-        "Delete the whole home folder and everything in it (documents, downloads, settings)" \
-        "WHY:Answer n to keep the files, for example if a forensics question may need them" && rmflag="-r"
-            pkill -KILL -u "$u" 2>/dev/null || true
-            crontab -r -u "$u" 2>/dev/null || true
-            if userdel $rmflag "$u" >>"$LOGFILE" 2>&1; then ok "Deleted user '$u'."; else bad "userdel failed for '$u' (see log)."; fi
-          fi
-          ;;
-        l|L)
-          if usermod -L -s /usr/sbin/nologin "$u" >>"$LOGFILE" 2>&1; then ok "Locked '$u' (password locked, shell = nologin)."; else bad "Could not lock '$u'."; fi
-          ;;
-        *) info "  Skipped '$u'." ;;
-      esac
-    done
-
-    # ---- 3) sudoer -> standard user (and the reverse) ----
-    for u in "${DEMOTE[@]}"; do
-      warn "'$u' is a sudoer but the roster lists them as a STANDARD user."
-      if is_protected "$u"; then warn "  '$u' is the account running this script — skipping."; continue; fi
-      if confirm_strict "  Remove '$u' from the sudo/admin/wheel group(s)?" \
-        "Remove '$u' from the groups that give administrator rights (sudo, admin, wheel)" \
-        "They keep their account and files but can no longer run commands with sudo" \
-        "WHY:The README lists them as a standard user, so admin rights here count as a problem"; then
-        for g in sudo admin wheel; do
-          if getent group "$g" >/dev/null 2>&1 && id -nG "$u" | tr ' ' '\n' | grep -qx "$g"; then
-            gpasswd -d "$u" "$g" >>"$LOGFILE" 2>&1 && ok "Removed '$u' from group '$g'."
-          fi
-        done
-        if is_sudoer "$u"; then warn "  '$u' still has admin rights (primary group or /etc/sudoers.d?) — check section 17."; fi
-      fi
-    done
-
-    ADMIN_GROUP=""
-    for g in sudo admin wheel; do
-      if getent group "$g" >/dev/null 2>&1; then ADMIN_GROUP="$g"; break; fi
-    done
-
-    for u in "${PROMOTE[@]}"; do
-      warn "'$u' is an authorized ADMIN but is not in a sudo group."
-      if [ -n "$ADMIN_GROUP" ] && confirm "  Add '$u' to group '$ADMIN_GROUP'?" \
-        "Add '$u' to the '$ADMIN_GROUP' group so they can use sudo" \
-        "WHY:The README lists them as an authorized administrator"; then
-        usermod -aG "$ADMIN_GROUP" "$u" >>"$LOGFILE" 2>&1 && ok "Added '$u' to '$ADMIN_GROUP'."
-      fi
-    done
-
-    # ---- 4) add users that are missing ----
-    for u in "${MISSING[@]}"; do
-      role="${ROSTER_ROLE[$u]}"
-      info "'$u' is on the roster as $role but has no account."
-      if confirm "  Create account '$u' ($role)?" \
-        "Create the account '$u' with a home folder and the bash shell (useradd)" \
-        "If they are an admin, add them to the sudo group" \
-        "Set their password from the roster, or ask you to type one" \
-        "WHY:The README lists them as authorized but they have no account"; then
-        if useradd -m -s /bin/bash "$u" >>"$LOGFILE" 2>&1 && getent passwd "$u" >/dev/null 2>&1; then
-          ok "Created user '$u'."
-          if [ "$role" = "admin" ] && [ -n "$ADMIN_GROUP" ]; then
-            usermod -aG "$ADMIN_GROUP" "$u" >>"$LOGFILE" 2>&1 && ok "  '$u' added to '$ADMIN_GROUP'."
-          fi
-          if [ -n "${ROSTER_PW[$u]+x}" ]; then
-            printf '%s:%s\n' "$u" "${ROSTER_PW[$u]}" | chpasswd && ok "  Password set from roster."
-          else
-            info "  No password in roster — set one now:"; passwd "$u"
+      s|S)
+        if is_sudoer "$u"; then
+          if is_protected "$u"; then warn "  Not demoting '$u' (the account running this script)."; continue; fi
+          if confirm_strict "  Make '$u' a STANDARD user (remove admin rights)?" \
+              "Remove '$u' from the groups that give administrator rights (sudo, admin, wheel)" \
+              "They keep their account and files but can no longer run commands with sudo" \
+              "WHY:Only do this if the README says '$u' is not an authorized administrator"; then
+            for g in sudo admin wheel; do
+              if getent group "$g" >/dev/null 2>&1 && id -nG "$u" | tr ' ' '\n' | grep -qx "$g"; then
+                gpasswd -d "$u" "$g" >>"$LOGFILE" 2>&1 && ok "Removed '$u' from group '$g'."
+              fi
+            done
+            is_sudoer "$u" && warn "  '$u' still has admin rights (check /etc/sudoers.d, section 17)."
           fi
         else
-          bad "Could not create '$u' (see log)."
+          if confirm "  Make '$u' an ADMINISTRATOR (can use sudo)?" \
+              "Add '$u' to the '${ADMIN_GROUP:-sudo}' group so they can use sudo" \
+              "WHY:Only do this if the README says '$u' is an authorized administrator"; then
+            usermod -aG "${ADMIN_GROUP:-sudo}" "$u" >>"$LOGFILE" 2>&1 && ok "Added '$u' to '${ADMIN_GROUP:-sudo}'."
+          fi
         fi
-      fi
-    done
+        ;;
 
-    # ---- optional: apply roster passwords to EXISTING accounts ----
-    for u in "${ROSTER_ORDER[@]}"; do
-      [ -n "${ROSTER_PW[$u]+x}" ] && [ -n "${SYS_SET[$u]+x}" ] || continue
-      if confirm_strict "Set EXISTING user '$u' password to the roster value? (default no)" \
-        "Change '$u' password to the one you gave in the roster" \
-        "WHY:Only do this if you want to force a specific password. Answer n to leave it alone"; then
-        printf '%s:%s\n' "$u" "${ROSTER_PW[$u]}" | chpasswd && ok "Password updated for '$u'."
+      p|P)
+        if confirm "  Change the password for '$u'?" \
+            "Run passwd for '$u'. You will type the new password twice (it is not shown on screen)" \
+            "WHY:Use a strong password: 12+ characters mixing upper, lower, numbers and symbols"; then
+          if passwd "$u"; then ok "Password changed for '$u'."; else warn "Password for '$u' was not changed."; fi
+        fi
+        ;;
+
+      l|L)
+        if is_protected "$u"; then warn "  Not locking '$u' (the account running this script)."; continue; fi
+        if confirm_strict "  Lock '$u' so they cannot log in?" \
+            "Lock their password and set their shell to nologin" \
+            "The account and files stay; it can be unlocked later with: sudo usermod -U $u" \
+            "WHY:Safer than deleting if you are unsure or may need their files for forensics"; then
+          usermod -L -s /usr/sbin/nologin "$u" >>"$LOGFILE" 2>&1 && ok "Locked '$u'."
+        fi
+        ;;
+
+      d|D)
+        if is_protected "$u"; then warn "  Not deleting '$u' (the account running this script)."; continue; fi
+        if confirm_strict "  Really DELETE '$u'? This cannot be undone." \
+            "Kill any running programs owned by '$u'" \
+            "Remove their scheduled cron jobs" \
+            "Delete the account (userdel). You will be asked next whether to delete their home folder too" \
+            "WHY:Only delete users the README does NOT list as authorized, and check no forensics question needs them"; then
+          rmflag=""
+          confirm_strict "  Also delete the home directory $(getent passwd "$u" | cut -d: -f6)?" \
+              "Delete the whole home folder and everything in it (documents, downloads, settings)" \
+              "WHY:Answer n to keep the files, for example if a forensics question may need them" && rmflag="-r"
+          pkill -KILL -u "$u" 2>/dev/null || true
+          crontab -r -u "$u" 2>/dev/null || true
+          if userdel $rmflag "$u" >>"$LOGFILE" 2>&1; then ok "Deleted user '$u'."; else bad "userdel failed for '$u' (see log)."; fi
+          return 0
+        fi
+        ;;
+
+      *) info "  Unknown choice '$choice'." ;;
+    esac
+  done
+}
+
+create_users_loop() {
+  local nu isadm
+  while confirm_strict "Create a new user account?" \
+      "You will type the new username and choose whether they are an administrator" \
+      "The account is created with a home folder, then you set their password" \
+      "WHY:Only create users the README lists as authorized but missing from the table above"; do
+    read -r -p "  New username (lowercase letters/numbers, e.g. jsmith): " nu || return 0
+    if ! [[ "$nu" =~ ^[a-z][-a-z0-9_]*$ ]]; then warn "  '$nu' is not a valid username."; continue; fi
+    if getent passwd "$nu" >/dev/null 2>&1; then warn "  '$nu' already exists."; continue; fi
+    read -r -p "  Make '$nu' an administrator (sudo)? [y/N] " isadm || isadm=""
+    if useradd -m -s /bin/bash "$nu" >>"$LOGFILE" 2>&1 && getent passwd "$nu" >/dev/null 2>&1; then
+      ok "Created user '$nu'."
+      if [[ "$isadm" =~ ^[Yy]$ ]] && [ -n "$ADMIN_GROUP" ]; then
+        usermod -aG "$ADMIN_GROUP" "$nu" >>"$LOGFILE" 2>&1 && ok "  '$nu' added to '$ADMIN_GROUP'."
       fi
-    done
-  else
-    info "No changes made."
-  fi
+      info "  Set a password for '$nu':"; passwd "$nu"
+    else
+      bad "Could not create '$nu' (see log)."
+    fi
+  done
+}
+
+info "Linux only stores one-way password hashes, so real passwords can't be shown."
+info "The PASSWORD column shows whether one is set, how it's stored, and when it last changed."
+show_user_table
+
+EMPTY_PW_USERS=""
+for u in $(list_human_users); do
+  case "$(pw_info "$u")" in EMPTY*) EMPTY_PW_USERS="$EMPTY_PW_USERS $u" ;; esac
+done
+[ -n "$EMPTY_PW_USERS" ] && bad "Accounts with NO password:$EMPTY_PW_USERS (set one with passwd, or lock/delete them)"
+
+OTHER_LOGIN="$(awk -F: '$3<1000 && $3!=0 && $7 !~ /(nologin|false|sync|shutdown|halt)$/ && $7!="" {print $1" ("$7")"}' /etc/passwd | tr '\n' ' ')"
+if [ -n "$OTHER_LOGIN" ]; then
+  warn "System accounts (UID < 1000) that can log in with a shell: $OTHER_LOGIN"
+  info "  These are usually normal on some systems, but investigate any you don't recognize."
+fi
+info "Note: this shows sudo/admin/wheel GROUP membership. Direct entries in /etc/sudoers.d are covered by section 17."
+
+if [ "$HARDEN" -ne 1 ]; then
+  info "Audit-only run: no account changes made. Re-run with --harden to manage users one by one."
+elif confirm_strict "Review each user above one at a time and optionally change them?" \
+    "For each user you can: change status (admin or standard), change password, lock, or delete" \
+    "Press Enter on a user to leave them unchanged" \
+    "Afterwards you can create new users, and the table is shown again so you can check the result" \
+    "Backs up /etc/passwd, /etc/shadow, /etc/group and /etc/gshadow first" \
+    "WHY:Compare the table with the README's authorized administrators and users"; then
+  for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do backup_file "$f"; done
+  ADMIN_GROUP=""
+  for g in sudo admin wheel; do
+    if getent group "$g" >/dev/null 2>&1; then ADMIN_GROUP="$g"; break; fi
+  done
+  for u in $(list_human_users); do
+    manage_user "$u"
+  done
+  create_users_loop
+  echo
+  info "Accounts after your changes:"
+  show_user_table
 fi
 
 # --- Password policy ---
@@ -1631,21 +1563,12 @@ if [ -n "${AM_SCHEMA:-}" ] && [ -n "${target_user:-}" ]; then
   vcheck "USB automount is off for $target_user" "$([ "$AMV" = "false" ] && echo 0 || echo 1)" "currently: ${AMV:-unknown}"
 fi
 
-# 8) Users vs roster (re-scan; only if a roster was loaded)
-if [ "${#ROSTER_ORDER[@]}" -gt 0 ]; then
-  V_EXTRA=""; V_ROLE=""; V_MISS=""
-  mapfile -t V_SYS < <(list_human_users)
-  declare -A V_SET=(); for u in "${V_SYS[@]}"; do V_SET[$u]=1; done
-  for u in "${V_SYS[@]}"; do [ -z "${ROSTER_ROLE[$u]+x}" ] && V_EXTRA="$V_EXTRA $u"; done
-  for u in "${ROSTER_ORDER[@]}"; do
-    if [ -z "${V_SET[$u]+x}" ]; then V_MISS="$V_MISS $u"; continue; fi
-    if is_sudoer "$u"; then r=admin; else r=user; fi
-    [ "$r" != "${ROSTER_ROLE[$u]}" ] && V_ROLE="$V_ROLE $u"
-  done
-  vcheck "No accounts outside the roster"   "$([ -z "$V_EXTRA" ] && echo 0 || echo 1)" "extra:$V_EXTRA"
-  vcheck "Every roster user exists"         "$([ -z "$V_MISS" ]  && echo 0 || echo 1)" "missing:$V_MISS"
-  vcheck "Everyone has the right sudo role" "$([ -z "$V_ROLE" ]  && echo 0 || echo 1)" "wrong role:$V_ROLE"
-fi
+# 8) Accounts: UID 0 and empty passwords (re-read live)
+UID0_NOW="$(awk -F: '($3==0 && $1!="root"){print $1}' /etc/passwd | tr '\n' ' ')"
+vcheck "Only root has UID 0" "$([ -z "${UID0_NOW// /}" ] && echo 0 || echo 1)" "also UID 0: $UID0_NOW"
+EMPTY_NOW=""
+for u in $(list_human_users); do case "$(pw_info "$u")" in EMPTY*) EMPTY_NOW="$EMPTY_NOW $u" ;; esac; done
+vcheck "No user accounts with an empty password" "$([ -z "${EMPTY_NOW// /}" ] && echo 0 || echo 1)" "empty:$EMPTY_NOW"
 
 # 9) Safety: every PAM module referenced actually exists (a missing one locks you out of sudo/login)
 mapfile -t PAM_HAVE < <(find /lib /lib64 /usr/lib -name 'pam_*.so' -printf '%f\n' 2>/dev/null | sort -u)
