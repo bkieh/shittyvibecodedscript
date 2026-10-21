@@ -5,14 +5,19 @@
 # Debian / Linux Mint audit + hardening helper, based on the
 # "Ultimate Linux Checklist" (CyberPatriot-style) document,
 # plus an Ubuntu-specific checklist (section 24), FTP removal (25) and
-# Mint Update Manager / full-upgrade steps (26).
+# Mint Update Manager / full-upgrade steps (26), and a roster-based
+# authorized-users check (5a), and a final re-verification pass.
 #
 # USAGE:
 #   sudo ./linux_checklist.sh                 # audit only (safe, read-only)
 #   sudo ./linux_checklist.sh --harden        # audit, then prompt before each
 #                                              # change-making step
 #   sudo ./linux_checklist.sh --harden --yes  # audit + apply changes with no
-#                                              # per-step prompts (use with care)
+#                                              # per-step prompts (use with care;
+#                                              # account deletions/demotions still ask)
+#   sudo ./linux_checklist.sh --roster=users.roster --harden
+#                                              # compare accounts to the README roster
+#                                              # (lines: name:role[:password], role=admin|user)
 #
 # All output is also written to a timestamped log file in the current
 # directory so you can review / backtrack what was done.
@@ -32,13 +37,15 @@ TS="$(date +%Y%m%d-%H%M%S)"
 LOGFILE="./linux_checklist-${TS}.log"
 HARDEN=0
 ASSUME_YES=0
+ROSTER_FILE=""
 
 for arg in "$@"; do
   case "$arg" in
     --harden) HARDEN=1 ;;
     --yes|-y) ASSUME_YES=1 ;;
+    --roster=*) ROSTER_FILE="${arg#--roster=}" ;;
     --help|-h)
-      echo "Usage: $0 [--harden] [--yes]"
+      echo "Usage: $0 [--harden] [--yes] [--roster=FILE]"
       exit 0
       ;;
   esac
@@ -72,6 +79,24 @@ confirm() {
   fi
   read -r -p "$(echo -e "${C_YELLOW}?${C_RESET} ${prompt} [y/N] ")" reply
   [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+confirm_strict() {
+  # Like confirm(), but ALWAYS asks — even with --yes. Used for destructive account changes.
+  local prompt="$1" reply
+  read -r -p "$(echo -e "${C_RED}?${C_RESET} ${prompt} [y/N] ")" reply
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# gsettings must run inside the logged-in user's desktop session. Under sudo there is no
+# D-Bus session, which causes "dconf-WARNING: Cannot autolaunch D-Bus without X11 $DISPLAY"
+# and the change is silently NOT saved. So point it at the user's existing session bus.
+user_gsettings() {
+  local u="$1"; shift
+  local uid; uid="$(id -u "$u" 2>/dev/null)" || return 1
+  [ -S "/run/user/$uid/bus" ] || return 1
+  sudo -u "$u" env "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+    XDG_RUNTIME_DIR="/run/user/$uid" gsettings "$@"
 }
 
 require_root() {
@@ -289,6 +314,249 @@ if command -v getent >/dev/null 2>&1 && [ -r /etc/shadow ]; then
     bad "Accounts with EMPTY passwords: $EMPTY_PW"
   else
     ok "No accounts with empty passwords."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 5a. Authorized Users Check (roster reconciliation)
+#
+# Flow: load the roster (README list: user, role, optional password)
+#   1) "checksum": scan the system and show what MATCHES / what's EXTRA / what's MISSING
+#   2) prompt: users NOT on the roster -> delete / lock / skip
+#   3) prompt: sudoers who should be standard users -> demote
+#      (and roster admins who are missing sudo -> promote)
+#   4) prompt: roster users with no account -> create them (with password + role)
+# Destructive account actions ALWAYS prompt, even with --yes.
+# Roster formats:  --roster=FILE  or  ./users.roster  (lines:  name:role[:password])
+#                  role = admin | user.  Lines starting with # are comments.
+#                  Or answer the prompts interactively. Passwords are never logged.
+# ---------------------------------------------------------------------------
+hdr "5a. Authorized Users Check (roster reconciliation)"
+
+declare -A ROSTER_ROLE=()
+declare -A ROSTER_PW=()
+ROSTER_ORDER=()
+INVOKER="$(logname 2>/dev/null || true)"
+
+norm_role() {
+  case "$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    admin|administrator|sudo|sudoer|sudoers|a) echo admin ;;
+    user|standard|normal|regular|u|"")         echo user ;;
+    *)                                         echo "" ;;
+  esac
+}
+
+roster_add() {
+  # roster_add <name> <role> <password-optional>
+  local name role pw="${3:-}"
+  name="$(echo "$1" | tr -d '[:space:]')"
+  role="$(norm_role "$2")"
+  [ -z "$name" ] && return 0
+  if [ "$name" = "root" ]; then warn "Roster entry 'root' ignored (root is never managed here)."; return 0; fi
+  if [ -z "$role" ]; then warn "Unknown role '$2' for '$name' — entry skipped (use admin or user)."; return 0; fi
+  if ! [[ "$name" =~ ^[a-z][-a-z0-9_]*$ ]]; then warn "Invalid username '$name' — entry skipped."; return 0; fi
+  if [ -z "${ROSTER_ROLE[$name]+x}" ]; then ROSTER_ORDER+=("$name"); fi
+  ROSTER_ROLE[$name]="$role"
+  if [ -n "$pw" ]; then ROSTER_PW[$name]="$pw"; fi
+}
+
+load_roster_file() {
+  local f="$1" line name role pw
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    IFS=: read -r name role pw <<<"$line"
+    roster_add "$name" "$role" "$pw"
+  done < "$f"
+}
+
+read_roster_interactive() {
+  local kind line name pw
+  for kind in admin user; do
+    if [ "$kind" = "admin" ]; then
+      echo "Authorized ADMINISTRATORS (sudoers) — one per line: name  or  name:password. Blank line = done."
+    else
+      echo "Authorized STANDARD users (NOT sudoers) — one per line: name  or  name:password. Blank line = done."
+    fi
+    while IFS= read -r -p "  > " line; do
+      [ -z "$line" ] && break
+      name="${line%%:*}"; pw=""
+      [[ "$line" == *:* ]] && pw="${line#*:}"
+      roster_add "$name" "$kind" "$pw"
+    done
+  done
+}
+
+list_human_users() {
+  local min max
+  min="$(awk '/^UID_MIN/{print $2}' /etc/login.defs 2>/dev/null)"; min="${min:-1000}"
+  max="$(awk '/^UID_MAX/{print $2}' /etc/login.defs 2>/dev/null)"; max="${max:-60000}"
+  getent passwd | awk -F: -v min="$min" -v max="$max" '$3>=min && $3<=max {print $1}' | sort
+}
+
+is_sudoer() {
+  id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qxE 'sudo|admin|wheel'
+}
+
+is_protected() {
+  [ "$1" = "root" ] || { [ -n "$INVOKER" ] && [ "$1" = "$INVOKER" ]; } || { [ -n "${SUDO_USER:-}" ] && [ "$1" = "${SUDO_USER:-}" ]; }
+}
+
+pw_status() {
+  passwd -S "$1" 2>/dev/null | awk '{print $2}' || true
+}
+
+# ---- load the roster ----
+if [ -n "${ROSTER_FILE:-}" ]; then
+  if [ -r "$ROSTER_FILE" ]; then
+    info "Loading roster from $ROSTER_FILE"; load_roster_file "$ROSTER_FILE"
+  else
+    warn "Roster file '$ROSTER_FILE' is not readable."
+  fi
+elif [ -r ./users.roster ]; then
+  info "Loading roster from ./users.roster"; load_roster_file ./users.roster
+elif [ -t 0 ] && confirm_strict "Enter the authorized users from the README now (admins, standard users, optional passwords)?"; then
+  read_roster_interactive
+fi
+
+if [ "${#ROSTER_ORDER[@]}" -eq 0 ]; then
+  info "No roster loaded — skipping. (Use --roster=FILE, ./users.roster, or answer the prompt next time.)"
+else
+  mapfile -t SYS_USERS < <(list_human_users)
+  declare -A SYS_SET=()
+  for u in "${SYS_USERS[@]}"; do SYS_SET[$u]=1; done
+
+  EXTRA=(); MISSING=(); DEMOTE=(); PROMOTE=(); MATCHED=0; N_ADMIN=0; N_USER=0
+  for u in "${ROSTER_ORDER[@]}"; do
+    if [ "${ROSTER_ROLE[$u]}" = "admin" ]; then N_ADMIN=$((N_ADMIN+1)); else N_USER=$((N_USER+1)); fi
+  done
+  for u in "${SYS_USERS[@]}"; do
+    [ -z "${ROSTER_ROLE[$u]+x}" ] && EXTRA+=("$u")
+  done
+  for u in "${ROSTER_ORDER[@]}"; do
+    if [ -z "${SYS_SET[$u]+x}" ]; then MISSING+=("$u"); continue; fi
+    if is_sudoer "$u"; then cur_role=admin; else cur_role=user; fi
+    want_role="${ROSTER_ROLE[$u]}"
+    if   [ "$want_role" = "admin" ] && [ "$cur_role" = "user"  ]; then PROMOTE+=("$u")
+    elif [ "$want_role" = "user"  ] && [ "$cur_role" = "admin" ]; then DEMOTE+=("$u")
+    else MATCHED=$((MATCHED+1)); fi
+  done
+
+  # ---- 1) the "checksum": what you have vs. what you should have ----
+  info "Roster checksum: ${#ROSTER_ORDER[@]} authorized ($N_ADMIN admin, $N_USER standard)  vs  ${#SYS_USERS[@]} human account(s) on this system"
+  {
+    printf '  %-16s %-9s %-9s %-5s %s\n' "USER" "ON SYSTEM" "ROSTER" "PW" "RESULT"
+    for u in "${SYS_USERS[@]}"; do
+      if is_sudoer "$u"; then sr=admin; else sr=user; fi
+      rr="-"; res="NOT ON ROSTER"
+      if [ -n "${ROSTER_ROLE[$u]+x}" ]; then
+        rr="${ROSTER_ROLE[$u]}"
+        if [ "$rr" = "$sr" ]; then res="ok"
+        elif [ "$rr" = "admin" ]; then res="NEEDS SUDO"
+        else res="SHOULD NOT BE SUDOER"; fi
+      fi
+      printf '  %-16s %-9s %-9s %-5s %s\n' "$u" "$sr" "$rr" "$(pw_status "$u")" "$res"
+    done
+    for u in "${MISSING[@]}"; do
+      printf '  %-16s %-9s %-9s %-5s %s\n' "$u" "-" "${ROSTER_ROLE[$u]}" "-" "MISSING"
+    done
+  } | tee -a "$LOGFILE"
+
+  ok  "$MATCHED account(s) match the roster exactly."
+  [ "${#EXTRA[@]}"   -gt 0 ] && bad "On the system but NOT on the roster (${#EXTRA[@]}): ${EXTRA[*]}"
+  [ "${#DEMOTE[@]}"  -gt 0 ] && bad "Sudoers who should be standard users (${#DEMOTE[@]}): ${DEMOTE[*]}"
+  [ "${#PROMOTE[@]}" -gt 0 ] && warn "Roster admins without sudo (${#PROMOTE[@]}): ${PROMOTE[*]}"
+  [ "${#MISSING[@]}" -gt 0 ] && warn "On the roster but missing from the system (${#MISSING[@]}): ${MISSING[*]}"
+  info "Note: this checks group membership (sudo/admin/wheel). Direct entries in /etc/sudoers.d are covered by section 17."
+
+  if [ "$HARDEN" -ne 1 ]; then
+    info "Audit-only run: no account changes made. Re-run with --harden to be prompted for each change."
+  elif [ "${#EXTRA[@]}" -eq 0 ] && [ "${#DEMOTE[@]}" -eq 0 ] && [ "${#PROMOTE[@]}" -eq 0 ] && [ "${#MISSING[@]}" -eq 0 ]; then
+    ok "Nothing to change — accounts match the roster."
+  elif confirm_strict "Roster above looks correct (typos here would delete the wrong users). Continue with prompted changes?"; then
+    for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do backup_file "$f"; done
+
+    # ---- 2) remove users that shouldn't be there ----
+    for u in "${EXTRA[@]}"; do
+      warn "'$u' is NOT on the roster (UID $(id -u "$u"), home $(getent passwd "$u" | cut -d: -f6), sudoer: $(is_sudoer "$u" && echo yes || echo no))"
+      if is_protected "$u"; then
+        warn "  '$u' is the account running this script — skipping (remove manually if intended)."
+        continue
+      fi
+      read -r -p "  [d]elete / [l]ock / [s]kip '$u'? [s] " choice
+      case "$choice" in
+        d|D)
+          if confirm_strict "  Really DELETE '$u'? This cannot be undone."; then
+            rmflag=""
+            confirm_strict "  Also delete the home directory $(getent passwd "$u" | cut -d: -f6)?" && rmflag="-r"
+            pkill -KILL -u "$u" 2>/dev/null || true
+            crontab -r -u "$u" 2>/dev/null || true
+            if userdel $rmflag "$u" >>"$LOGFILE" 2>&1; then ok "Deleted user '$u'."; else bad "userdel failed for '$u' (see log)."; fi
+          fi
+          ;;
+        l|L)
+          if usermod -L -s /usr/sbin/nologin "$u" >>"$LOGFILE" 2>&1; then ok "Locked '$u' (password locked, shell = nologin)."; else bad "Could not lock '$u'."; fi
+          ;;
+        *) info "  Skipped '$u'." ;;
+      esac
+    done
+
+    # ---- 3) sudoer -> standard user (and the reverse) ----
+    for u in "${DEMOTE[@]}"; do
+      warn "'$u' is a sudoer but the roster lists them as a STANDARD user."
+      if is_protected "$u"; then warn "  '$u' is the account running this script — skipping."; continue; fi
+      if confirm_strict "  Remove '$u' from the sudo/admin/wheel group(s)?"; then
+        for g in sudo admin wheel; do
+          if getent group "$g" >/dev/null 2>&1 && id -nG "$u" | tr ' ' '\n' | grep -qx "$g"; then
+            gpasswd -d "$u" "$g" >>"$LOGFILE" 2>&1 && ok "Removed '$u' from group '$g'."
+          fi
+        done
+        if is_sudoer "$u"; then warn "  '$u' still has admin rights (primary group or /etc/sudoers.d?) — check section 17."; fi
+      fi
+    done
+
+    ADMIN_GROUP=""
+    for g in sudo admin wheel; do
+      if getent group "$g" >/dev/null 2>&1; then ADMIN_GROUP="$g"; break; fi
+    done
+
+    for u in "${PROMOTE[@]}"; do
+      warn "'$u' is an authorized ADMIN but is not in a sudo group."
+      if [ -n "$ADMIN_GROUP" ] && confirm "  Add '$u' to group '$ADMIN_GROUP'?"; then
+        usermod -aG "$ADMIN_GROUP" "$u" >>"$LOGFILE" 2>&1 && ok "Added '$u' to '$ADMIN_GROUP'."
+      fi
+    done
+
+    # ---- 4) add users that are missing ----
+    for u in "${MISSING[@]}"; do
+      role="${ROSTER_ROLE[$u]}"
+      info "'$u' is on the roster as $role but has no account."
+      if confirm "  Create account '$u' ($role)?"; then
+        if useradd -m -s /bin/bash "$u" >>"$LOGFILE" 2>&1 && getent passwd "$u" >/dev/null 2>&1; then
+          ok "Created user '$u'."
+          if [ "$role" = "admin" ] && [ -n "$ADMIN_GROUP" ]; then
+            usermod -aG "$ADMIN_GROUP" "$u" >>"$LOGFILE" 2>&1 && ok "  '$u' added to '$ADMIN_GROUP'."
+          fi
+          if [ -n "${ROSTER_PW[$u]+x}" ]; then
+            printf '%s:%s\n' "$u" "${ROSTER_PW[$u]}" | chpasswd && ok "  Password set from roster."
+          else
+            info "  No password in roster — set one now:"; passwd "$u"
+          fi
+        else
+          bad "Could not create '$u' (see log)."
+        fi
+      fi
+    done
+
+    # ---- optional: apply roster passwords to EXISTING accounts ----
+    for u in "${ROSTER_ORDER[@]}"; do
+      [ -n "${ROSTER_PW[$u]+x}" ] && [ -n "${SYS_SET[$u]+x}" ] || continue
+      if confirm_strict "Set EXISTING user '$u' password to the roster value? (default no)"; then
+        printf '%s:%s\n' "$u" "${ROSTER_PW[$u]}" | chpasswd && ok "Password updated for '$u'."
+      fi
+    done
+  else
+    info "No changes made."
   fi
 fi
 
@@ -1039,6 +1307,35 @@ else
   info "mintupdate-automation not found (not Mint, or Update Manager not installed) — apt auto-updates are handled in sections 23/24."
 fi
 
+# --- Auto refresh / automation status (read-only checks) ---
+info "Update Manager -> Preferences -> Automation should show: Apply updates automatically = ON."
+info "  (Also on that tab: 'Update flatpaks automatically' and 'Remove obsolete kernels and dependencies' — optional.)"
+
+if grep -q 'Update-Package-Lists "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
+  ok "APT refreshes the package lists daily (/etc/apt/apt.conf.d/20auto-upgrades)."
+else
+  bad "APT daily list refresh is NOT set in /etc/apt/apt.conf.d/20auto-upgrades (section 24 sets it with --harden)."
+fi
+
+if ls /etc/cron.daily /etc/cron.weekly /etc/cron.d 2>/dev/null | grep -qi mintupdate; then
+  ok "Mint Update Manager automation job(s) found:"
+  ls -l /etc/cron.daily/*mintupdate* /etc/cron.weekly/*mintupdate* /etc/cron.d/*mintupdate* 2>/dev/null | tee -a "$LOGFILE"
+else
+  info "No mintupdate job found under cron.daily/weekly/d — it may be stored elsewhere on this release; verify in the GUI."
+fi
+
+AR_USER="$(logname 2>/dev/null || echo "${SUDO_USER:-}")"
+if [ -n "$AR_USER" ] && [ "$AR_USER" != "root" ] && command -v gsettings >/dev/null 2>&1 \
+   && gsettings list-schemas 2>/dev/null | grep -qx 'com.linuxmint.updates'; then
+  info "Update Manager refresh settings for $AR_USER (com.linuxmint.updates):"
+  for k in $(gsettings list-keys com.linuxmint.updates 2>/dev/null | grep -i 'refresh'); do
+    v="$(user_gsettings "$AR_USER" get com.linuxmint.updates "$k" 2>/dev/null)"
+    info "  $k = ${v:-unknown (no desktop session)}"
+  done
+else
+  info "Check the auto-refresh interval in Update Manager -> Edit -> Preferences -> Options."
+fi
+
 info "Install updates (important security updates):"
 info "  GUI: Update Manager -> Refresh -> Install Updates   (auto-apply must be set in Preferences first)"
 info "  CLI: sudo apt update && sudo apt full-upgrade -y"
@@ -1052,17 +1349,6 @@ fi
 # Extra: disable automount
 # ---------------------------------------------------------------------------
 hdr "Extra: USB Automount"
-
-# gsettings must run inside the logged-in user's desktop session. Under sudo there is no
-# D-Bus session, which causes "dconf-WARNING: Cannot autolaunch D-Bus without X11 $DISPLAY"
-# and the change is silently NOT saved. So point it at the user's existing session bus.
-user_gsettings() {
-  local u="$1"; shift
-  local uid; uid="$(id -u "$u" 2>/dev/null)" || return 1
-  [ -S "/run/user/$uid/bus" ] || return 1
-  sudo -u "$u" env "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
-    XDG_RUNTIME_DIR="/run/user/$uid" gsettings "$@"
-}
 
 if command -v gsettings >/dev/null 2>&1; then
   target_user="$(logname 2>/dev/null || echo "${SUDO_USER:-}")"
@@ -1097,6 +1383,96 @@ if command -v gsettings >/dev/null 2>&1; then
       fi
     fi
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Final verification: re-read the REAL state of everything (like "refresh the list")
+# so a step that printed [OK] but didn't actually stick shows up here.
+# ---------------------------------------------------------------------------
+hdr "Final Verification (re-check actual state)"
+
+V_PASS=0; V_FAIL=0
+vcheck() {
+  # vcheck <label> <0|1 result: 0 = good> [detail on failure]
+  if [ "$2" -eq 0 ]; then ok "$1"; V_PASS=$((V_PASS+1)); else bad "$1${3:+ — $3}"; V_FAIL=$((V_FAIL+1)); fi
+}
+
+# 1) Updates: refresh the list, then count what's still pending
+if [ "$HARDEN" -eq 1 ] && confirm "Refresh the package list now (apt-get update) before counting pending updates?"; then
+  apt-get update >>"$LOGFILE" 2>&1
+fi
+PENDING="$(apt list --upgradable 2>/dev/null | grep -c 'upgradable')"
+SEC_PENDING="$(apt list --upgradable 2>/dev/null | grep -ci 'security')"
+vcheck "No pending package updates" "$([ "${PENDING:-0}" -eq 0 ] && echo 0 || echo 1)" "$PENDING pending ($SEC_PENDING security) — run: sudo apt update && sudo apt full-upgrade -y"
+
+# 2) Automatic updates configured
+AU=/etc/apt/apt.conf.d/20auto-upgrades
+vcheck "APT refreshes the package list daily" "$(grep -q 'Update-Package-Lists "1"' $AU 2>/dev/null && echo 0 || echo 1)" "not set in $AU"
+vcheck "Unattended (automatic) upgrades enabled" "$(grep -q 'Unattended-Upgrade "1"' $AU 2>/dev/null && echo 0 || echo 1)" "not set in $AU"
+
+# 3) Firewall
+if command -v ufw >/dev/null 2>&1; then
+  UFW_OUT="$(ufw status verbose 2>/dev/null)"
+  vcheck "UFW is active" "$(echo "$UFW_OUT" | grep -q 'Status: active' && echo 0 || echo 1)" "run: sudo ufw enable"
+  vcheck "UFW default for incoming is deny/reject" "$(echo "$UFW_OUT" | grep -Eq 'Default: (deny|reject) \(incoming\)' && echo 0 || echo 1)" "run: sudo ufw default deny incoming"
+else
+  vcheck "UFW installed" 1 "ufw not found"
+fi
+
+# 4) SSH effective config (if sshd exists)
+if command -v sshd >/dev/null 2>&1; then
+  PRL="$(sshd -T 2>/dev/null | awk '/^permitrootlogin/{print $2}')"
+  vcheck "sshd PermitRootLogin = no" "$([ "$PRL" = "no" ] && echo 0 || echo 1)" "effective value: ${PRL:-unknown}"
+fi
+
+# 5) sysctl values (the same table section 15 uses) — reads the live kernel value
+for key in "${!SYSCTL_CHECKS[@]}"; do
+  cur="$(sysctl -n "$key" 2>/dev/null || echo unknown)"
+  vcheck "sysctl $key = ${SYSCTL_CHECKS[$key]}" "$([ "$cur" = "${SYSCTL_CHECKS[$key]}" ] && echo 0 || echo 1)" "currently $cur"
+done
+
+# 6) FTP server gone
+FTP_LEFT=""
+for pkg in vsftpd proftpd-basic proftpd pure-ftpd pure-ftpd-common; do
+  dpkg -l "$pkg" 2>/dev/null | grep -q '^ii' && FTP_LEFT="$FTP_LEFT $pkg"
+done
+vcheck "No FTP server installed" "$([ -z "$FTP_LEFT" ] && echo 0 || echo 1)" "still installed:$FTP_LEFT"
+
+# 7) Automount (needs the desktop session; uses values from the USB step)
+if [ -n "${AM_SCHEMA:-}" ] && [ -n "${target_user:-}" ]; then
+  AMV="$(user_gsettings "$target_user" get "$AM_SCHEMA" automount 2>/dev/null)"
+  vcheck "USB automount is off for $target_user" "$([ "$AMV" = "false" ] && echo 0 || echo 1)" "currently: ${AMV:-unknown}"
+fi
+
+# 8) Users vs roster (re-scan; only if a roster was loaded)
+if [ "${#ROSTER_ORDER[@]}" -gt 0 ]; then
+  V_EXTRA=""; V_ROLE=""; V_MISS=""
+  mapfile -t V_SYS < <(list_human_users)
+  declare -A V_SET=(); for u in "${V_SYS[@]}"; do V_SET[$u]=1; done
+  for u in "${V_SYS[@]}"; do [ -z "${ROSTER_ROLE[$u]+x}" ] && V_EXTRA="$V_EXTRA $u"; done
+  for u in "${ROSTER_ORDER[@]}"; do
+    if [ -z "${V_SET[$u]+x}" ]; then V_MISS="$V_MISS $u"; continue; fi
+    if is_sudoer "$u"; then r=admin; else r=user; fi
+    [ "$r" != "${ROSTER_ROLE[$u]}" ] && V_ROLE="$V_ROLE $u"
+  done
+  vcheck "No accounts outside the roster"   "$([ -z "$V_EXTRA" ] && echo 0 || echo 1)" "extra:$V_EXTRA"
+  vcheck "Every roster user exists"         "$([ -z "$V_MISS" ]  && echo 0 || echo 1)" "missing:$V_MISS"
+  vcheck "Everyone has the right sudo role" "$([ -z "$V_ROLE" ]  && echo 0 || echo 1)" "wrong role:$V_ROLE"
+fi
+
+# 9) Safety: every PAM module referenced actually exists (a missing one locks you out of sudo/login)
+mapfile -t PAM_HAVE < <(find /lib /lib64 /usr/lib -name 'pam_*.so' -printf '%f\n' 2>/dev/null | sort -u)
+PAM_BAD=""
+for mod in $(cat /etc/pam.d/* 2>/dev/null | grep -v '^[[:space:]]*#' | grep -oE 'pam_[A-Za-z0-9_]+\.so' | sort -u); do
+  printf '%s\n' "${PAM_HAVE[@]}" | grep -qx "$mod" || PAM_BAD="$PAM_BAD $mod"
+done
+vcheck "All PAM modules in /etc/pam.d exist (no lockout risk)" "$([ -z "$PAM_BAD" ] && echo 0 || echo 1)" "MISSING:$PAM_BAD — fix BEFORE logging out/rebooting (restore the .bak file)"
+
+echo
+if [ "$V_FAIL" -eq 0 ]; then
+  ok "Verification: all $V_PASS checks passed."
+else
+  bad "Verification: $V_FAIL failed, $V_PASS passed. Fix the [FLAG] lines above and re-run."
 fi
 
 # ---------------------------------------------------------------------------
